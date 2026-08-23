@@ -1,0 +1,26 @@
+name: ScannerApp
+
+options:
+  bundleIdPrefix: com.local
+  deploymentTarget:
+    iOS: "17.0"
+
+targets:
+  ScannerApp:
+    type: application
+    platform: iOS
+
+    sources:
+      - ScannerApp
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.iphone3dscanner
+        SWIFT_VERSION: 5.0
+        TARGETED_DEVICE_FAMILY: "1"
+
+    info:
+      path: ScannerApp/Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSCameraUsageDescription: "Camera access is required for 3D scanning."
