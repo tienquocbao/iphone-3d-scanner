@@ -1,0 +1,6 @@
+name: iphone3d
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+prefix: C:\Users\tienq\.conda\envs\iphone3d
