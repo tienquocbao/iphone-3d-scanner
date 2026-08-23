@@ -11,14 +11,16 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-latest
+    runs-on: macos-26
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+      - name: Select Xcode 26.5
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.5.app/Contents/Developer
+          xcodebuild -version
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -35,6 +37,7 @@ jobs:
             -scheme ScannerApp \
             -configuration Debug \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath ../../build/ios \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -44,6 +47,7 @@ jobs:
       - name: Package unsigned IPA
         run: |
           mkdir -p dist/Payload
+
           cp -R \
             build/ios/Build/Products/Debug-iphoneos/ScannerApp.app \
             dist/Payload/
