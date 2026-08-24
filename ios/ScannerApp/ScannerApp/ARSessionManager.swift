@@ -235,29 +235,29 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
 
         if let live = try? LiveUploadService(serverURLString: TransferSettings.serverURL, authToken: authTokenText) {
             liveUploadService = live
-            Task {
-                do {
-                    try await live.start(sessionID: newSessionID)
-                    await MainActor.run { self.liveConnectionStatus = "CONNECTED" }
-                    self.liveStatusTask = Task { [weak self] in
-                        while !Task.isCancelled {
-                            try? await Task.sleep(for: .seconds(1))
-                            guard let self else { return }
-                            do {
-                                let status = try await live.status(sessionID: newSessionID)
-                                await MainActor.run {
-                                    self.uploadedFrameCount = status.uploadedFiles / 4
-                                    self.processedFrameCount = status.processedFrames
-                                    self.uploadBacklog = status.uploadBacklogFiles
-                                    self.liveConnectionStatus = "CONNECTED"
-                                }
-                            } catch {
-                                await MainActor.run { self.liveConnectionStatus = "RECONNECTING" }
-                            }
+            liveStatusTask = Task { [weak self] in
+                var started = false
+                while !Task.isCancelled {
+                    guard let self else { return }
+                    do {
+                        if !started {
+                            try await live.start(sessionID: newSessionID)
+                            started = true
+                        }
+                        let status = try await live.status(sessionID: newSessionID)
+                        await MainActor.run {
+                            self.uploadedFrameCount = status.uploadedFiles / 4
+                            self.processedFrameCount = status.processedFrames
+                            self.uploadBacklog = status.uploadBacklogFiles
+                            self.liveConnectionStatus = "CONNECTED"
+                        }
+                    } catch {
+                        started = false
+                        await MainActor.run {
+                            self.liveConnectionStatus = "RECONNECTING; LOCAL CAPTURE CONTINUES"
                         }
                     }
-                } catch {
-                    await MainActor.run { self.liveConnectionStatus = "OFFLINE; LOCAL CAPTURE CONTINUES" }
+                    try? await Task.sleep(for: .seconds(1))
                 }
             }
         } else {
