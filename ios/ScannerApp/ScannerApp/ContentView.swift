@@ -24,10 +24,23 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 16)
 
-                    Button("Capture Frame") {
-                        manager.requestCapture()
+                    if manager.scanState == .recording {
+                        Button("Stop Scan") {
+                            manager.stopScan()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else if manager.scanState == .finalizing {
+                        ProgressView("Finalizing...")
+                    } else {
+                        Button(
+                            manager.scanState == .readyToTransfer
+                                ? "Start New Scan"
+                                : "Start Scan"
+                        ) {
+                            manager.startScan()
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    .buttonStyle(.borderedProminent)
 
                     Text("Move the phone slowly")
                         .font(.footnote)
@@ -56,6 +69,12 @@ struct ContentView: View {
                 .font(.headline)
 
             Divider()
+
+            HStack {
+                Text("Scan")
+                Spacer()
+                Text(manager.scanState.rawValue)
+            }
 
             HStack {
                 Text("LiDAR")

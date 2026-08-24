@@ -7,6 +7,7 @@ enum FrameCaptureError: LocalizedError {
     case sceneDepthUnavailable
     case confidenceUnavailable
     case invalidDimensions
+    case invalidRGBData
     case invalidDepthDataSize
     case invalidConfidenceDataSize
     case nonFiniteCameraMatrix
@@ -20,6 +21,8 @@ enum FrameCaptureError: LocalizedError {
             return "confidence map is unavailable"
         case .invalidDimensions:
             return "depth and confidence dimensions do not match"
+        case .invalidRGBData:
+            return "RGB JPEG data is missing or empty"
         case .invalidDepthDataSize:
             return "depth data size is invalid"
         case .invalidConfidenceDataSize:
@@ -173,6 +176,79 @@ final class FrameCaptureService {
         )
     }
 
+    func finalizeSession(
+        sessionID: String,
+        frameCount: Int
+    ) throws -> SessionFinalizationResult {
+        let documentsURL = fileManager.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        let sessionDirectory = documentsURL
+            .appendingPathComponent("Scans", isDirectory: true)
+            .appendingPathComponent("session_\(sessionID)", isDirectory: true)
+        let framesDirectory = sessionDirectory.appendingPathComponent(
+            "frames",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(
+            at: framesDirectory,
+            withIntermediateDirectories: true
+        )
+
+        var checkedFrames = 0
+        for frameIndex in 0..<frameCount {
+            let frameDirectory = framesDirectory.appendingPathComponent(
+                String(format: "%06d", frameIndex),
+                isDirectory: true
+            )
+            try validateFrameDirectory(frameDirectory)
+            checkedFrames += 1
+        }
+
+        let metadata = SessionMetadata(
+            schemaVersion: 1,
+            sessionID: sessionID,
+            frameCount: frameCount,
+            framesDirectory: "frames",
+            finalizedAtUTC: ISO8601DateFormatter().string(from: Date()),
+            validation: SessionValidation(
+                valid: true,
+                checkedFrames: checkedFrames,
+                message: "All frame files and metadata validated"
+            )
+        )
+        let sessionData = try JSONEncoder().encodedSessionMetadata(metadata)
+        try sessionData.write(
+            to: sessionDirectory.appendingPathComponent("session.json"),
+            options: .atomic
+        )
+
+        return SessionFinalizationResult(
+            sessionID: sessionID,
+            frameCount: frameCount,
+            directory: sessionDirectory
+        )
+    }
+
+    private func validateFrameDirectory(_ directory: URL) throws {
+        let metadataData = try Data(contentsOf: directory.appendingPathComponent("frame.json"))
+        let metadata = try JSONDecoder().decode(FrameMetadata.self, from: metadataData)
+        let depthData = try Data(contentsOf: directory.appendingPathComponent(metadata.depth.file))
+        let confidenceData = try Data(contentsOf: directory.appendingPathComponent(metadata.confidence.file))
+        let rgbData = try Data(contentsOf: directory.appendingPathComponent(metadata.rgb.file))
+
+        guard !rgbData.isEmpty else { throw FrameCaptureError.invalidRGBData }
+        guard depthData.count == metadata.depth.width * metadata.depth.height * 4 else {
+            throw FrameCaptureError.invalidDepthDataSize
+        }
+        guard confidenceData.count == metadata.confidence.width * metadata.confidence.height,
+              metadata.confidence.width == metadata.depth.width,
+              metadata.confidence.height == metadata.depth.height else {
+            throw FrameCaptureError.invalidConfidenceDataSize
+        }
+    }
+
     private func copyDepthData(
         _ pixelBuffer: CVPixelBuffer,
         width: Int,
@@ -231,6 +307,11 @@ final class FrameCaptureService {
 
 private extension JSONEncoder {
     func encodedMetadata(_ metadata: FrameMetadata) throws -> Data {
+        outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encode(metadata)
+    }
+
+    func encodedSessionMetadata(_ metadata: SessionMetadata) throws -> Data {
         outputFormatting = [.prettyPrinted, .sortedKeys]
         return try encode(metadata)
     }

@@ -12,11 +12,15 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var centerDepth: Float?
     @Published var confidence = "-"
     @Published var captureStatus = "Ready"
+    @Published var scanState: ScanState = .idle
+    @Published var capturedFrameCount = 0
 
     private let captureService = FrameCaptureService()
     private let captureStateLock = NSLock()
-    private let sessionID = UUID().uuidString.lowercased()
-    private var captureRequested = false
+    private let captureQueue = DispatchQueue(label: "com.local.iphone3dscanner.capture")
+    private var sessionID = UUID().uuidString.lowercased()
+    private var recording = false
+    private var lastCaptureTimestamp: TimeInterval?
     private var nextFrameIndex = 0
 
     override init() {
@@ -66,13 +70,57 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         session.pause()
     }
 
-    func requestCapture() {
+    func startScan() {
         captureStateLock.lock()
-        captureRequested = true
+        guard !recording else {
+            captureStateLock.unlock()
+            return
+        }
+        sessionID = UUID().uuidString.lowercased()
+        nextFrameIndex = 0
+        lastCaptureTimestamp = nil
+        recording = true
         captureStateLock.unlock()
 
         DispatchQueue.main.async {
-            self.captureStatus = "Waiting for valid RGB-D frame..."
+            self.scanState = .recording
+            self.capturedFrameCount = 0
+            self.captureStatus = "Recording synchronized RGB-D frames..."
+        }
+    }
+
+    func stopScan() {
+        captureStateLock.lock()
+        guard recording else {
+            captureStateLock.unlock()
+            return
+        }
+        recording = false
+        let finishingSessionID = sessionID
+        let finishingFrameCount = nextFrameIndex
+        captureStateLock.unlock()
+
+        DispatchQueue.main.async {
+            self.scanState = .finalizing
+            self.captureStatus = "Finalizing session..."
+        }
+
+        captureQueue.async {
+            do {
+                let result = try self.captureService.finalizeSession(
+                    sessionID: finishingSessionID,
+                    frameCount: finishingFrameCount
+                )
+                DispatchQueue.main.async {
+                    self.scanState = .readyToTransfer
+                    self.captureStatus = "Session ready: \(result.frameCount) frames validated"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.scanState = .idle
+                    self.captureStatus = "Finalization failed: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -100,9 +148,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             confidenceText = readCenterConfidence(confidenceMap)
         }
 
-        if captureIsRequested {
-            captureFrame(frame, sceneDepthAvailable: true)
-        }
+        captureFrameIfRecording(frame)
 
         DispatchQueue.main.async {
             self.trackingStatus = tracking
@@ -112,21 +158,21 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    private var captureIsRequested: Bool {
+    private func captureFrameIfRecording(_ frame: ARFrame) {
         captureStateLock.lock()
-        defer { captureStateLock.unlock() }
-        return captureRequested
-    }
+        guard recording else {
+            captureStateLock.unlock()
+            return
+        }
 
-    private func captureFrame(
-        _ frame: ARFrame,
-        sceneDepthAvailable: Bool
-    ) {
-        guard sceneDepthAvailable else { return }
+        if let lastCaptureTimestamp,
+           frame.timestamp - lastCaptureTimestamp < 0.2 {
+            captureStateLock.unlock()
+            return
+        }
 
         guard frame.sceneDepth?.confidenceMap != nil else {
-            _ = consumeCaptureRequest()
-            reportCaptureFailure("Capture failed: confidence map unavailable")
+            captureStateLock.unlock()
             return
         }
 
@@ -134,39 +180,31 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         do {
             capturedFrame = try captureService.extract(frame: frame)
         } catch {
-            _ = consumeCaptureRequest()
-            reportCaptureFailure("Capture failed: \(error.localizedDescription)")
+            captureStateLock.unlock()
             return
         }
 
-        guard let frameIndex = consumeCaptureRequest() else { return }
+        let frameIndex = nextFrameIndex
+        nextFrameIndex += 1
+        lastCaptureTimestamp = frame.timestamp
         let currentSessionID = sessionID
+        captureStateLock.unlock()
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        captureQueue.async {
             do {
-                let result = try self.captureService.persist(
+                _ = try self.captureService.persist(
                     capturedFrame,
                     sessionID: currentSessionID,
                     frameIndex: frameIndex
                 )
                 DispatchQueue.main.async {
-                    self.captureStatus = "Captured frame \(result.frameIndex) | RGB \(result.rgbWidth) x \(result.rgbHeight) | depth \(result.depthWidth) x \(result.depthHeight) | \(result.depthBytes) B depth, \(result.confidenceBytes) B confidence"
+                    self.capturedFrameCount = frameIndex + 1
+                    self.captureStatus = "Recording frame \(frameIndex)"
                 }
             } catch {
                 self.reportCaptureFailure("Capture failed: \(error.localizedDescription)")
             }
         }
-    }
-
-    private func consumeCaptureRequest() -> Int? {
-        captureStateLock.lock()
-        defer { captureStateLock.unlock() }
-
-        guard captureRequested else { return nil }
-        captureRequested = false
-        let frameIndex = nextFrameIndex
-        nextFrameIndex += 1
-        return frameIndex
     }
 
     private func reportCaptureFailure(_ message: String) {

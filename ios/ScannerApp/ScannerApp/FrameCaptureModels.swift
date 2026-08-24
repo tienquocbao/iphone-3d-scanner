@@ -1,5 +1,13 @@
 import Foundation
 
+enum ScanState: String {
+    case idle = "IDLE"
+    case recording = "RECORDING"
+    case finalizing = "FINALIZING"
+    case readyToTransfer = "READY_TO_TRANSFER"
+    case transferredVerified = "TRANSFERRED + VERIFIED"
+}
+
 struct FrameMetadata: Codable {
     let schemaVersion: Int
     let frameIndex: Int
@@ -135,4 +143,34 @@ struct CaptureResult {
     let depthWidth: Int
     let depthHeight: Int
     let confidenceBytes: Int
+}
+
+struct SessionValidation: Codable {
+    let valid: Bool
+    let checkedFrames: Int
+    let message: String
+}
+
+struct SessionMetadata: Codable {
+    let schemaVersion: Int
+    let sessionID: String
+    let frameCount: Int
+    let framesDirectory: String
+    let finalizedAtUTC: String
+    let validation: SessionValidation
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case sessionID = "session_id"
+        case frameCount = "frame_count"
+        case framesDirectory = "frames_directory"
+        case finalizedAtUTC = "finalized_at_utc"
+        case validation
+    }
+}
+
+struct SessionFinalizationResult {
+    let sessionID: String
+    let frameCount: Int
+    let directory: URL
 }
