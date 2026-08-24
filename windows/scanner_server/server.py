@@ -9,11 +9,18 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+RECONSTRUCTION_ROOT = Path(__file__).resolve().parents[1] / "reconstruction"
+if str(RECONSTRUCTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(RECONSTRUCTION_ROOT))
 
 PROTOCOL_VERSION = 1
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -79,6 +86,114 @@ def load_verified_receipt(path: Path, session_id: str, manifest_hash: str) -> di
     return canonical_verified_ack(session_id, manifest_hash, file_count, total_bytes)
 
 
+class LiveSession:
+    """Bounded, ordered processing state for one live staging session."""
+
+    def __init__(self, session_id: str, staging: Path):
+        self.session_id = session_id
+        self.staging = staging
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.stop_requested = False
+        self.uploaded_files = 0
+        self.uploaded_bytes = 0
+        self.ready_frames = 0
+        self.processed_frames = 0
+        self.raw_points = 0
+        self.last_frame_index: int | None = None
+        self.processing_fps = 0.0
+        self.preview_interval_frames = 10
+        self.tsdf_volume = None
+        self.worker = threading.Thread(target=self._run, name=f"live-{session_id}", daemon=True)
+        self.worker.start()
+
+    def record_upload(self, byte_count: int) -> None:
+        with self.condition:
+            self.uploaded_files += 1
+            self.uploaded_bytes += byte_count
+            self.condition.notify_all()
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock:
+            ready = self._ready_indexes()
+            self.ready_frames = len(ready)
+            return {
+                "protocol_version": PROTOCOL_VERSION,
+                "session_id": self.session_id,
+                "state": "recording" if not self.stop_requested else "stopped",
+                "uploaded_files": self.uploaded_files,
+                "uploaded_bytes": self.uploaded_bytes,
+                "ready_frames": self.ready_frames,
+                "processed_frames": self.processed_frames,
+                "next_processing_frame": self.processed_frames,
+                "upload_backlog_files": max(0, self.uploaded_files - self.processed_frames * 4),
+                "raw_points": self.raw_points,
+                "last_frame_index": self.last_frame_index,
+                "processing_fps": self.processing_fps,
+            }
+
+    def stop(self) -> None:
+        with self.condition:
+            self.stop_requested = True
+            self.condition.notify_all()
+
+    def _ready_indexes(self) -> list[int]:
+        frames = self.staging / "frames"
+        if not frames.is_dir():
+            return []
+        indexes = []
+        for directory in frames.iterdir():
+            if not directory.is_dir() or not directory.name.isdigit():
+                continue
+            if all((directory / name).is_file() for name in ("rgb.jpg", "depth.f32", "confidence.u8", "frame.json")):
+                indexes.append(int(directory.name))
+        return sorted(indexes)
+
+    def _run(self) -> None:
+        started = time.monotonic()
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.stop_requested or self._ready_indexes())
+                indexes = self._ready_indexes()
+                next_index = self.processed_frames
+                if next_index not in indexes:
+                    if self.stop_requested:
+                        return
+                    continue
+            try:
+                from frame_io import load_frame
+                from geometry import depth_to_world_points
+                from tsdf import TSDFPolicy, prepare_tsdf_frame, write_point_cloud
+                import open3d as o3d
+
+                frame = load_frame(self.staging / "frames" / f"{next_index:06d}")
+                points, _, _ = depth_to_world_points(frame, min_confidence=1)
+                if self.tsdf_volume is None:
+                    policy = TSDFPolicy()
+                    self.tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
+                        voxel_length=policy.voxel_length,
+                        sdf_trunc=policy.sdf_trunc,
+                        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
+                    )
+                prepared = prepare_tsdf_frame(frame, TSDFPolicy())
+                self.tsdf_volume.integrate(prepared.rgbd, prepared.intrinsic, prepared.extrinsic)
+                with self.condition:
+                    self.raw_points += len(points)
+                    self.processed_frames += 1
+                    self.last_frame_index = next_index
+                    elapsed = max(time.monotonic() - started, 1e-6)
+                    self.processing_fps = self.processed_frames / elapsed
+                    should_preview = self.processed_frames % self.preview_interval_frames == 0
+                if should_preview:
+                    preview_path = self.staging.parent / ".live" / self.session_id / "preview_pointcloud.ply"
+                    write_point_cloud(preview_path, self.tsdf_volume.extract_point_cloud())
+            except Exception as exc:
+                print(f"LIVE processing failed session={self.session_id} frame={next_index}: {exc}", flush=True)
+                with self.condition:
+                    self.processed_frames += 1
+                    self.last_frame_index = next_index
+
+
 def safe_relative_path(value: object) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise TransferError("invalid relative file path")
@@ -126,12 +241,40 @@ class Receiver:
     def __init__(self, storage_root: Path):
         self.storage_root = Path(storage_root).resolve()
         self.storage_root.mkdir(parents=True, exist_ok=True)
+        self.live_sessions: dict[str, LiveSession] = {}
+        self.live_lock = threading.Lock()
 
     def staging(self, session_id: str) -> Path:
         return self.storage_root / f".session_{session_id}.staging"
 
     def completed(self, session_id: str) -> Path:
         return self.storage_root / f"session_{session_id}"
+
+    def start_live(self, session_id: str) -> dict[str, object]:
+        session_id = safe_session_id(session_id)
+        with self.live_lock:
+            if session_id in self.live_sessions:
+                return self.live_sessions[session_id].snapshot()
+            staging = self.staging(session_id)
+            staging.mkdir(parents=True, exist_ok=True)
+            self.live_sessions[session_id] = LiveSession(session_id, staging)
+            return self.live_sessions[session_id].snapshot()
+
+    def live_session(self, session_id: str) -> LiveSession:
+        with self.live_lock:
+            live = self.live_sessions.get(session_id)
+        if live is None:
+            raise TransferError("live session has not been started")
+        return live
+
+    def live_status(self, session_id: str) -> dict[str, object]:
+        return self.live_session(safe_session_id(session_id)).snapshot()
+
+    def stop_live(self, session_id: str) -> None:
+        with self.live_lock:
+            live = self.live_sessions.pop(session_id, None)
+        if live is not None:
+            live.stop()
 
     def begin(self, payload: object) -> dict[str, object]:
         session_id, entries, manifest_hash = validate_manifest(payload)
@@ -182,6 +325,37 @@ class Receiver:
         os.replace(temporary, destination)
         return {"protocol_version": PROTOCOL_VERSION, "status": "stored", "session_id": session_id, "path": relative, "sha256": expected["sha256"]}
 
+    def put_live_file(self, session_id: str, relative: str, content_length: int, expected_sha256: str, body) -> dict[str, object]:
+        session_id = safe_session_id(session_id)
+        relative = safe_relative_path(relative)
+        if not relative.startswith("frames/") or relative.endswith("/"):
+            raise TransferError("live uploads must be immutable frame files")
+        if not re.fullmatch(r"frames/\d{6}/(rgb\.jpg|depth\.f32|confidence\.u8|frame\.json)", relative):
+            raise TransferError("invalid live frame path")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise TransferError("invalid live sha256")
+        live = self.live_session(session_id)
+        destination = live.staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".live-upload-", delete=False) as handle:
+            temporary = Path(handle.name)
+            digest = hashlib.sha256()
+            remaining = content_length
+            while remaining:
+                chunk = body.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    temporary.unlink(missing_ok=True)
+                    raise TransferError("request body ended before Content-Length")
+                handle.write(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+        if digest.hexdigest() != expected_sha256:
+            temporary.unlink(missing_ok=True)
+            raise TransferError("sha256 mismatch")
+        os.replace(temporary, destination)
+        live.record_upload(content_length)
+        return {"protocol_version": PROTOCOL_VERSION, "status": "stored", "session_id": session_id, "path": relative, "sha256": expected_sha256}
+
     def finalize(self, payload: object) -> dict[str, object]:
         session_id, entries, manifest_hash = validate_manifest(payload)
         staging = self.staging(session_id)
@@ -219,6 +393,7 @@ class Receiver:
                 raise TransferError("completed session path is not a directory")
             shutil.rmtree(final)
         os.replace(staging, final)
+        self.stop_live(session_id)
         print("FINALIZE validation=PASS", flush=True)
         return verified
 
@@ -285,7 +460,12 @@ class Handler(BaseHTTPRequestHandler):
             self._check_protocol()
             path = urlparse(self.path).path.rstrip("/")
             payload = self._json_body()
-            if path == "/v1/sessions/begin":
+            live_parts = path.split("/")
+            if len(live_parts) == 7 and live_parts[1:5] == ["api", "v1", "live", "sessions"] and live_parts[6] == "start":
+                session_id = safe_session_id(live_parts[5])
+                print(f"REQUEST stage=LIVE_START session={session_id}", flush=True)
+                self._send(HTTPStatus.OK, self.receiver.start_live(session_id))
+            elif path == "/v1/sessions/begin":
                 if isinstance(payload, dict):
                     print(f"REQUEST stage=BEGIN session={payload.get('session_id', '<invalid>')}", flush=True)
                 self._send(HTTPStatus.OK, self.receiver.begin(payload))
@@ -314,6 +494,18 @@ class Handler(BaseHTTPRequestHandler):
             self._check_auth()
             self._check_protocol()
             parts = [unquote(part) for part in urlparse(self.path).path.split("/")]
+            if len(parts) >= 7 and parts[1:5] == ["api", "v1", "live", "sessions"] and parts[6] == "files":
+                session_id = safe_session_id(parts[5])
+                relative = "/".join(parts[7:])
+                print(f"REQUEST stage=LIVE_UPLOAD session={session_id} path={relative}", flush=True)
+                length = int(self.headers.get("Content-Length", "-1"))
+                expected_sha256 = self.headers.get("X-File-SHA256", "")
+                if length < 0:
+                    raise TransferError("Content-Length is required")
+                response = self.receiver.put_live_file(session_id, relative, length, expected_sha256, self.rfile)
+                print(f"LIVE_UPLOAD received={length} sha256=PASS", flush=True)
+                self._send(HTTPStatus.OK, response)
+                return
             if len(parts) < 6 or parts[1:4] != ["v1", "sessions", parts[3]] or parts[4] != "files":
                 raise TransferError("invalid file upload path")
             session_id = safe_session_id(parts[3])
@@ -336,7 +528,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             print(f"REQUEST method=GET route={urlparse(self.path).path}", flush=True)
             self._check_auth()
-            if urlparse(self.path).path != "/api/v1/health":
+            path = urlparse(self.path).path.rstrip("/")
+            parts = path.split("/")
+            if len(parts) == 7 and parts[1:5] == ["api", "v1", "live", "sessions"] and parts[6] == "status":
+                session_id = safe_session_id(parts[5])
+                self._send(HTTPStatus.OK, self.receiver.live_status(session_id))
+                return
+            if path != "/api/v1/health":
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             self._send(HTTPStatus.OK, {"protocol_version": PROTOCOL_VERSION, "status": "ok", "auth_required": bool(getattr(self.server, "auth_token", None))})

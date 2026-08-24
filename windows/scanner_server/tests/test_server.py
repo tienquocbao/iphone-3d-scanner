@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from http.client import HTTPConnection
 from pathlib import Path
@@ -186,3 +187,71 @@ class ReceiverTests(unittest.TestCase):
         status, response = self.request("POST", "/v1/sessions/large-test/finalize", manifest)
         self.assertEqual((status, response["status"], response["verified_file_count"]), (200, "verified", 517))
         self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
+
+    def test_live_routes_require_auth_and_stage_concurrent_frame_files(self):
+        status, _ = self.request("POST", "/api/v1/live/sessions/live-test/start", {}, token="wrong")
+        self.assertEqual(status, 401)
+        status, response = self.request("POST", "/api/v1/live/sessions/live-test/start", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(response["state"], "recording")
+
+        files = {
+            "frames/000000/rgb.jpg": b"rgb-live",
+            "frames/000000/depth.f32": b"depth-live",
+            "frames/000000/confidence.u8": b"confidence-live",
+            "frames/000000/frame.json": b"{\"frame_index\":0}",
+        }
+
+        def upload(item):
+            path, data = item
+            connection = HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=30)
+            headers = {
+                "Content-Length": str(len(data)),
+                "Content-Type": "application/octet-stream",
+                "X-Protocol-Version": str(PROTOCOL_VERSION),
+                "X-File-SHA256": hashlib.sha256(data).hexdigest(),
+                "Authorization": "Bearer test-token",
+            }
+            connection.request("PUT", "/api/v1/live/sessions/live-test/files/" + path, data, headers)
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            connection.close()
+            return response.status, payload
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(upload, files.items()))
+        self.assertTrue(all(status == 200 for status, _ in results))
+        status, response = self.request("GET", "/api/v1/live/sessions/live-test/status", b"")
+        self.assertEqual(status, 200)
+        self.assertEqual(response["uploaded_files"], 4)
+        self.assertEqual(response["ready_frames"], 1)
+
+        status, response = self.request(
+            "PUT",
+            "/api/v1/live/sessions/live-test/files/../escape",
+            b"x",
+            "application/octet-stream",
+        )
+        self.assertEqual(status, 400)
+
+    def test_final_begin_reconciles_live_staged_frame_files(self):
+        manifest, files = self.manifest()
+        self.request("POST", "/api/v1/live/sessions/abc/start", {})
+        for path, data in files.items():
+            if path == "session.json":
+                continue
+            headers = {
+                "Content-Length": str(len(data)),
+                "Content-Type": "application/octet-stream",
+                "X-File-SHA256": hashlib.sha256(data).hexdigest(),
+            }
+            connection = HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=30)
+            headers["X-Protocol-Version"] = str(PROTOCOL_VERSION)
+            headers["Authorization"] = "Bearer test-token"
+            connection.request("PUT", "/api/v1/live/sessions/abc/files/" + path, data, headers)
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+        status, response = self.request("POST", "/v1/sessions/begin", manifest)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["missing"], ["session.json"])

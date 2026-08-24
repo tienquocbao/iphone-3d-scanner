@@ -36,6 +36,13 @@ struct ContentView: View {
                     }
 
                     if manager.scanState == .recording {
+                        Text("Captured \(manager.capturedFrameCount)  Uploaded \(manager.uploadedFrameCount)  Processed \(manager.processedFrameCount)")
+                            .font(.caption2.monospaced())
+                        Text("Windows \(manager.liveConnectionStatus)  Backlog \(manager.uploadBacklog)")
+                            .font(.caption2.monospaced())
+                    }
+
+                    if manager.scanState == .recording {
                         Button("Stop Scan") {
                             manager.stopScan()
                         }

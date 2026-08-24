@@ -20,6 +20,10 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var serverURLText = TransferSettings.serverURL
     @Published var authTokenText = ""
     @Published var isTransferring = false
+    @Published var uploadedFrameCount = 0
+    @Published var processedFrameCount = 0
+    @Published var uploadBacklog = 0
+    @Published var liveConnectionStatus = "NOT CONFIGURED"
 
     private let captureService = FrameCaptureService()
     private lazy var transferService = SessionTransferService(captureService: captureService)
@@ -34,6 +38,8 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     private var sessionBytes: Int64 = 0
     private var sessionStartedAt = Date()
     private var writePending = false
+    private var liveUploadService: LiveUploadService?
+    private var liveStatusTask: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -226,6 +232,37 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             self.storageText = "0 B"
             self.captureStatus = "Recording synchronized RGB-D frames..."
         }
+
+        if let live = try? LiveUploadService(serverURLString: TransferSettings.serverURL, authToken: authTokenText) {
+            liveUploadService = live
+            Task {
+                do {
+                    try await live.start(sessionID: newSessionID)
+                    await MainActor.run { self.liveConnectionStatus = "CONNECTED" }
+                    self.liveStatusTask = Task { [weak self] in
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: .seconds(1))
+                            guard let self else { return }
+                            do {
+                                let status = try await live.status(sessionID: newSessionID)
+                                await MainActor.run {
+                                    self.uploadedFrameCount = status.uploadedFiles / 4
+                                    self.processedFrameCount = status.processedFrames
+                                    self.uploadBacklog = status.uploadBacklogFiles
+                                    self.liveConnectionStatus = "CONNECTED"
+                                }
+                            } catch {
+                                await MainActor.run { self.liveConnectionStatus = "RECONNECTING" }
+                            }
+                        }
+                    }
+                } catch {
+                    await MainActor.run { self.liveConnectionStatus = "OFFLINE; LOCAL CAPTURE CONTINUES" }
+                }
+            }
+        } else {
+            liveConnectionStatus = "NOT CONFIGURED"
+        }
     }
 
     func stopScan() {
@@ -250,22 +287,27 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         captureQueue.async {
-            do {
-                let result = try self.captureService.finalizeSession(
-                    sessionID: finishingSessionID,
-                    frameCount: self.successfulFrameCount,
-                    totalBytes: self.sessionBytes,
-                    startedAt: finishingStartedAt
-                )
-                DispatchQueue.main.async {
-                    self.scanState = .completed
-                    self.capturedFrameCount = result.frameCount
-                    self.captureStatus = "Session complete: \(result.frameCount) frames validated"
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.scanState = .error
-                    self.captureStatus = "Finalization failed: \(error.localizedDescription)"
+            Task {
+                await self.liveUploadService?.finishAndWait()
+                do {
+                    let result = try self.captureService.finalizeSession(
+                        sessionID: finishingSessionID,
+                        frameCount: self.successfulFrameCount,
+                        totalBytes: self.sessionBytes,
+                        startedAt: finishingStartedAt
+                    )
+                    DispatchQueue.main.async {
+                        self.liveStatusTask?.cancel()
+                        self.scanState = .completed
+                        self.capturedFrameCount = result.frameCount
+                        self.captureStatus = "Session complete: \(result.frameCount) frames validated"
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.liveStatusTask?.cancel()
+                        self.scanState = .error
+                        self.captureStatus = "Finalization failed: \(error.localizedDescription)"
+                    }
                 }
             }
         }
@@ -375,6 +417,18 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                 let totalBytes = self.sessionBytes
                 let startedAt = self.sessionStartedAt
                 self.captureStateLock.unlock()
+                if let live = self.liveUploadService {
+                    let enqueueComplete = DispatchSemaphore(value: 0)
+                    Task {
+                        await live.enqueueFrame(
+                            sessionID: currentSessionID,
+                            frameDirectory: result.directory,
+                            frameIndex: frameIndex
+                        )
+                        enqueueComplete.signal()
+                    }
+                    enqueueComplete.wait()
+                }
                 DispatchQueue.main.async {
                     self.capturedFrameCount = frameCount
                     self.durationText = self.formatDuration(Date().timeIntervalSince(startedAt))

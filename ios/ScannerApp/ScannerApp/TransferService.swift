@@ -66,6 +66,12 @@ struct TransferSettings {
     }
 }
 
+struct TransferPolicy {
+    let maxConcurrentUploads: Int
+
+    static let `default` = TransferPolicy(maxConcurrentUploads: 4)
+}
+
 enum KeychainStore {
     private static let service = "com.local.iphone3dscanner.transfer"
     private static let account = "receiver-bearer-token"
@@ -218,10 +224,12 @@ final class SessionTransferService {
     private let fileManager = FileManager.default
     private let captureService: FrameCaptureService
     private let session: URLSession
+    private let policy: TransferPolicy
 
-    init(captureService: FrameCaptureService, session: URLSession = .shared) {
+    init(captureService: FrameCaptureService, session: URLSession = .shared, policy: TransferPolicy = .default) {
         self.captureService = captureService
         self.session = session
+        self.policy = policy
     }
 
     func transfer(sessionID: String, serverURLString: String, authToken: String) async throws -> TransferResult {
@@ -263,17 +271,32 @@ final class SessionTransferService {
         guard begin.status == "ready" else { throw TransferError(stage: .begin, message: "Unexpected BEGIN status: \(begin.status)") }
 
         let filesByPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
+        var missingFiles: [TransferFile] = []
         for relativePath in begin.missing ?? [] {
             guard let expected = filesByPath[relativePath] else { throw TransferError(stage: .upload, message: "Receiver requested a file not present in manifest", filePath: relativePath) }
-            let localURL = TransferPath.localURL(sessionRoot: sessionDirectory, relativePath: relativePath)
-            guard fileManager.fileExists(atPath: localURL.path) else { throw TransferError(stage: .upload, message: "Local file was not found", filePath: relativePath) }
-            try await upload(
-                endpoint(serverURL, components: ["v1", "sessions", sessionID, "files", relativePath]),
-                fileURL: localURL,
-                expected: expected,
-                token: authToken,
-                stage: .upload
-            )
+            missingFiles.append(expected)
+        }
+        let cursor = TransferUploadCursor(files: missingFiles)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            let workerCount = min(policy.maxConcurrentUploads, max(1, missingFiles.count))
+            for _ in 0..<workerCount {
+                group.addTask {
+                    while let expected = await cursor.next() {
+                        let localURL = TransferPath.localURL(sessionRoot: sessionDirectory, relativePath: expected.path)
+                        guard self.fileManager.fileExists(atPath: localURL.path) else {
+                            throw TransferError(stage: .upload, message: "Local file was not found", filePath: expected.path)
+                        }
+                        try await self.upload(
+                            self.endpoint(serverURL, components: ["v1", "sessions", sessionID, "files", expected.path]),
+                            fileURL: localURL,
+                            expected: expected,
+                            token: authToken,
+                            stage: .upload
+                        )
+                    }
+                }
+            }
+            try await group.waitForAll()
         }
 
         let verified = try await post(
@@ -449,5 +472,20 @@ final class SessionTransferService {
         } catch {
             throw TransferError(stage: .finalize, message: "Cannot encode finalize manifest", underlying: error)
         }
+    }
+}
+
+private actor TransferUploadCursor {
+    private let files: [TransferFile]
+    private var index = 0
+
+    init(files: [TransferFile]) {
+        self.files = files
+    }
+
+    func next() -> TransferFile? {
+        guard index < files.count else { return nil }
+        defer { index += 1 }
+        return files[index]
     }
 }
