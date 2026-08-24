@@ -16,6 +16,10 @@ session_pointcloud_*.ply
 **/session_pointcloud_*.ply
 camera_trajectory*.csv
 **/camera_trajectory*.csv
+session_tsdf_*.ply
+**/session_tsdf_*.ply
+session_mesh_*.ply
+**/session_mesh_*.ply
 
 # macOS
 .DS_Store
