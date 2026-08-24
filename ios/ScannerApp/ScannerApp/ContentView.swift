@@ -4,6 +4,8 @@ struct ContentView: View {
 
     @StateObject private var manager =
         ARSessionManager()
+    @State private var showingDeleteConfirmation = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
 
@@ -24,6 +26,15 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 16)
 
+                    if manager.scanState == .recording || manager.scanState == .completed {
+                        HStack(spacing: 18) {
+                            Text("Frames \(manager.capturedFrameCount)")
+                            Text("Duration \(manager.durationText)")
+                            Text("Storage \(manager.storageText)")
+                        }
+                        .font(.caption.monospaced())
+                    }
+
                     if manager.scanState == .recording {
                         Button("Stop Scan") {
                             manager.stopScan()
@@ -31,12 +42,13 @@ struct ContentView: View {
                         .buttonStyle(.borderedProminent)
                     } else if manager.scanState == .finalizing {
                         ProgressView("Finalizing...")
+                    } else if manager.scanState == .completed {
+                        Button("Delete Session", role: .destructive) {
+                            showingDeleteConfirmation = true
+                        }
+                        .buttonStyle(.bordered)
                     } else {
-                        Button(
-                            manager.scanState == .readyToTransfer
-                                ? "Start New Scan"
-                                : "Start Scan"
-                        ) {
+                        Button("Start Scan") {
                             manager.startScan()
                         }
                         .buttonStyle(.borderedProminent)
@@ -58,6 +70,19 @@ struct ContentView: View {
         }
         .onDisappear {
             manager.pause()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background {
+                manager.pause()
+            }
+        }
+        .alert("Delete completed session?", isPresented: $showingDeleteConfirmation) {
+            Button("Delete", role: .destructive) {
+                manager.deleteCompletedSession()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes only the current completed session from the iPhone.")
         }
     }
 

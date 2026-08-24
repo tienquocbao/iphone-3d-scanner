@@ -4,8 +4,8 @@ enum ScanState: String {
     case idle = "IDLE"
     case recording = "RECORDING"
     case finalizing = "FINALIZING"
-    case readyToTransfer = "READY_TO_TRANSFER"
-    case transferredVerified = "TRANSFERRED + VERIFIED"
+    case completed = "COMPLETED"
+    case error = "ERROR"
 }
 
 struct FrameMetadata: Codable {
@@ -143,6 +143,7 @@ struct CaptureResult {
     let depthWidth: Int
     let depthHeight: Int
     let confidenceBytes: Int
+    let totalBytes: Int64
 }
 
 struct SessionValidation: Codable {
@@ -151,20 +152,54 @@ struct SessionValidation: Codable {
     let message: String
 }
 
+struct RecordingPolicyMetadata: Codable {
+    let minimumFrameIntervalSeconds: Double
+    let translationThresholdMeters: Double
+    let rotationThresholdDegrees: Double
+
+    enum CodingKeys: String, CodingKey {
+        case minimumFrameIntervalSeconds = "minimum_frame_interval_seconds"
+        case translationThresholdMeters = "translation_threshold_meters"
+        case rotationThresholdDegrees = "rotation_threshold_degrees"
+    }
+}
+
+struct SensorMetadata: Codable {
+    let depthUnit: String
+    let coordinateSystem: String
+
+    enum CodingKeys: String, CodingKey {
+        case depthUnit = "depth_unit"
+        case coordinateSystem = "coordinate_system"
+    }
+}
+
 struct SessionMetadata: Codable {
     let schemaVersion: Int
     let sessionID: String
+    let status: String
+    let startedAtUTC: String
+    let endedAtUTC: String?
+    let durationSeconds: Double
     let frameCount: Int
-    let framesDirectory: String
-    let finalizedAtUTC: String
-    let validation: SessionValidation
+    let totalBytes: Int64
+    let captureMode: String
+    let recordingPolicy: RecordingPolicyMetadata
+    let sensor: SensorMetadata
+    let validation: SessionValidation?
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case sessionID = "session_id"
+        case status
+        case startedAtUTC = "started_at_utc"
+        case endedAtUTC = "ended_at_utc"
+        case durationSeconds = "duration_seconds"
         case frameCount = "frame_count"
-        case framesDirectory = "frames_directory"
-        case finalizedAtUTC = "finalized_at_utc"
+        case totalBytes = "total_bytes"
+        case captureMode = "capture_mode"
+        case recordingPolicy = "recording_policy"
+        case sensor
         case validation
     }
 }

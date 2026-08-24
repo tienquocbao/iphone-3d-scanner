@@ -26,3 +26,15 @@ targets:
         NSCameraUsageDescription: "Camera access is required for 3D scanning."
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+
+  ScannerAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: ScannerApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.iphone3dscanner.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ScannerApp.app/ScannerApp"

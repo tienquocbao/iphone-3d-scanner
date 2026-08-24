@@ -1,6 +1,7 @@
 import Foundation
 import ARKit
 import Combine
+import UIKit
 
 final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
 
@@ -14,18 +15,29 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var captureStatus = "Ready"
     @Published var scanState: ScanState = .idle
     @Published var capturedFrameCount = 0
+    @Published var durationText = "00:00"
+    @Published var storageText = "0 B"
 
     private let captureService = FrameCaptureService()
+    private let recordingPolicy = RecordingPolicy()
+    private let storagePolicy = StoragePolicy.default
+    private let keyframeSelector = KeyframeSelector()
     private let captureStateLock = NSLock()
     private let captureQueue = DispatchQueue(label: "com.local.iphone3dscanner.capture")
     private var sessionID = UUID().uuidString.lowercased()
     private var recording = false
-    private var lastCaptureTimestamp: TimeInterval?
     private var nextFrameIndex = 0
+    private var sessionBytes: Int64 = 0
+    private var sessionStartedAt = Date()
+    private var writePending = false
 
     override init() {
         super.init()
         session.delegate = self
+        let incompleteCount = captureService.incompleteSessionIDs().count
+        if incompleteCount > 0 {
+            captureStatus = "Incomplete session found; kept for manual cleanup"
+        }
     }
 
     func start() {
@@ -67,29 +79,95 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func pause() {
+        captureStateLock.lock()
+        let wasRecording = recording
+        captureStateLock.unlock()
+        if wasRecording {
+            stopScan(message: "App paused; finalizing session...")
+        }
         session.pause()
     }
 
+    func deleteCompletedSession() {
+        guard scanState == .completed else { return }
+        let completedSessionID = sessionID
+        do {
+            try captureService.deleteSession(sessionID: completedSessionID)
+            DispatchQueue.main.async {
+                self.scanState = .idle
+                self.capturedFrameCount = 0
+                self.durationText = "00:00"
+                self.storageText = "0 B"
+                self.captureStatus = "Completed session deleted"
+            }
+        } catch {
+            reportScanError("Delete failed: \(error.localizedDescription)")
+        }
+    }
+
     func startScan() {
+        captureStateLock.lock()
+        let alreadyRecording = recording
+        captureStateLock.unlock()
+        guard !alreadyRecording else { return }
+
+        guard ARWorldTrackingConfiguration.isSupported,
+              ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else {
+            reportScanError("Cannot start: LiDAR sceneDepth is unavailable")
+            return
+        }
+
+        let documentsURL = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        guard storagePolicy.canStart(at: documentsURL) else {
+            reportScanError("Cannot start: less than 2 GB free storage")
+            return
+        }
+
+        let newSessionID = UUID().uuidString.lowercased()
+        let startDate = Date()
+        do {
+            try captureService.initializeSession(
+                sessionID: newSessionID,
+                startedAt: startDate,
+                policy: recordingPolicy
+            )
+        } catch {
+            reportScanError("Cannot create session: \(error.localizedDescription)")
+            return
+        }
+
         captureStateLock.lock()
         guard !recording else {
             captureStateLock.unlock()
             return
         }
-        sessionID = UUID().uuidString.lowercased()
+        sessionID = newSessionID
         nextFrameIndex = 0
-        lastCaptureTimestamp = nil
+        sessionBytes = 0
+        sessionStartedAt = startDate
+        writePending = false
+        keyframeSelector.reset()
         recording = true
         captureStateLock.unlock()
 
         DispatchQueue.main.async {
+            UIApplication.shared.isIdleTimerDisabled = true
             self.scanState = .recording
             self.capturedFrameCount = 0
+            self.durationText = "00:00"
+            self.storageText = "0 B"
             self.captureStatus = "Recording synchronized RGB-D frames..."
         }
     }
 
     func stopScan() {
+        stopScan(message: "Finalizing session...")
+    }
+
+    private func stopScan(message: String) {
         captureStateLock.lock()
         guard recording else {
             captureStateLock.unlock()
@@ -97,27 +175,31 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         }
         recording = false
         let finishingSessionID = sessionID
-        let finishingFrameCount = nextFrameIndex
+        let finishingStartedAt = sessionStartedAt
         captureStateLock.unlock()
 
         DispatchQueue.main.async {
+            UIApplication.shared.isIdleTimerDisabled = false
             self.scanState = .finalizing
-            self.captureStatus = "Finalizing session..."
+            self.captureStatus = message
         }
 
         captureQueue.async {
             do {
                 let result = try self.captureService.finalizeSession(
                     sessionID: finishingSessionID,
-                    frameCount: finishingFrameCount
+                    frameCount: self.successfulFrameCount,
+                    totalBytes: self.sessionBytes,
+                    startedAt: finishingStartedAt
                 )
                 DispatchQueue.main.async {
-                    self.scanState = .readyToTransfer
-                    self.captureStatus = "Session ready: \(result.frameCount) frames validated"
+                    self.scanState = .completed
+                    self.capturedFrameCount = result.frameCount
+                    self.captureStatus = "Session complete: \(result.frameCount) frames validated"
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.scanState = .idle
+                    self.scanState = .error
                     self.captureStatus = "Finalization failed: \(error.localizedDescription)"
                 }
             }
@@ -165,14 +247,38 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
 
-        if let lastCaptureTimestamp,
-           frame.timestamp - lastCaptureTimestamp < 0.2 {
+        guard !writePending else {
             captureStateLock.unlock()
             return
         }
 
-        guard frame.sceneDepth?.confidenceMap != nil else {
+        let hasDepth = frame.sceneDepth != nil
+        let hasConfidence = frame.sceneDepth?.confidenceMap != nil
+        let trackingIsNormal: Bool
+        if case .normal = frame.camera.trackingState {
+            trackingIsNormal = true
+        } else {
+            trackingIsNormal = false
+        }
+
+        guard keyframeSelector.shouldCapture(
+            timestamp: frame.timestamp,
+            transform: frame.camera.transform,
+            trackingIsNormal: trackingIsNormal,
+            hasDepth: hasDepth,
+            hasConfidence: hasConfidence
+        ) else {
             captureStateLock.unlock()
+            return
+        }
+
+        let documentsURL = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        guard storagePolicy.canContinue(at: documentsURL, sessionBytes: sessionBytes) else {
+            captureStateLock.unlock()
+            stopScan(message: "Storage limit reached; finalizing session...")
             return
         }
 
@@ -185,26 +291,60 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         let frameIndex = nextFrameIndex
-        nextFrameIndex += 1
-        lastCaptureTimestamp = frame.timestamp
         let currentSessionID = sessionID
+        writePending = true
         captureStateLock.unlock()
 
         captureQueue.async {
             do {
-                _ = try self.captureService.persist(
+                let result = try self.captureService.persist(
                     capturedFrame,
                     sessionID: currentSessionID,
                     frameIndex: frameIndex
                 )
+                self.captureStateLock.lock()
+                self.nextFrameIndex += 1
+                self.sessionBytes += result.totalBytes
+                self.writePending = false
+                let frameCount = self.nextFrameIndex
+                let totalBytes = self.sessionBytes
+                let startedAt = self.sessionStartedAt
+                self.captureStateLock.unlock()
                 DispatchQueue.main.async {
-                    self.capturedFrameCount = frameIndex + 1
+                    self.capturedFrameCount = frameCount
+                    self.durationText = self.formatDuration(Date().timeIntervalSince(startedAt))
+                    self.storageText = self.formatBytes(totalBytes)
                     self.captureStatus = "Recording frame \(frameIndex)"
                 }
             } catch {
+                self.captureStateLock.lock()
+                self.writePending = false
+                self.captureStateLock.unlock()
                 self.reportCaptureFailure("Capture failed: \(error.localizedDescription)")
+                self.stopScan(message: "Capture failed; finalizing session...")
             }
         }
+    }
+
+    private var successfulFrameCount: Int {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return nextFrameIndex
+    }
+
+    private func reportScanError(_ message: String) {
+        DispatchQueue.main.async {
+            self.scanState = .error
+            self.captureStatus = message
+        }
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60)
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     private func reportCaptureFailure(_ message: String) {

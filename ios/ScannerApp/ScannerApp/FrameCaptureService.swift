@@ -8,6 +8,7 @@ enum FrameCaptureError: LocalizedError {
     case confidenceUnavailable
     case invalidDimensions
     case invalidRGBData
+    case frameAlreadyExists
     case invalidDepthDataSize
     case invalidConfidenceDataSize
     case nonFiniteCameraMatrix
@@ -23,6 +24,8 @@ enum FrameCaptureError: LocalizedError {
             return "depth and confidence dimensions do not match"
         case .invalidRGBData:
             return "RGB JPEG data is missing or empty"
+        case .frameAlreadyExists:
+            return "Frame directory already exists"
         case .invalidDepthDataSize:
             return "depth data size is invalid"
         case .invalidConfidenceDataSize:
@@ -136,32 +139,45 @@ final class FrameCaptureService {
             .appendingPathComponent("session_\(sessionID)", isDirectory: true)
             .appendingPathComponent("frames", isDirectory: true)
             .appendingPathComponent(String(format: "%06d", frameIndex), isDirectory: true)
+        let temporaryDirectory = frameDirectory.deletingLastPathComponent()
+            .appendingPathComponent(".tmp_\(String(format: "%06d", frameIndex))", isDirectory: true)
 
         try fileManager.createDirectory(
-            at: frameDirectory,
+            at: temporaryDirectory,
             withIntermediateDirectories: true
         )
+        var committed = false
+        defer {
+            if !committed {
+                try? fileManager.removeItem(at: temporaryDirectory)
+            }
+        }
 
         let metadata = try JSONEncoder().encodedMetadata(
             frame.metadata(frameIndex: frameIndex)
         )
 
         try frame.rgbJPEG.write(
-            to: frameDirectory.appendingPathComponent("rgb.jpg"),
+            to: temporaryDirectory.appendingPathComponent("rgb.jpg"),
             options: .atomic
         )
         try frame.depthData.write(
-            to: frameDirectory.appendingPathComponent("depth.f32"),
+            to: temporaryDirectory.appendingPathComponent("depth.f32"),
             options: .atomic
         )
         try frame.confidenceData.write(
-            to: frameDirectory.appendingPathComponent("confidence.u8"),
+            to: temporaryDirectory.appendingPathComponent("confidence.u8"),
             options: .atomic
         )
         try metadata.write(
-            to: frameDirectory.appendingPathComponent("frame.json"),
+            to: temporaryDirectory.appendingPathComponent("frame.json"),
             options: .atomic
         )
+        guard !fileManager.fileExists(atPath: frameDirectory.path) else {
+            throw FrameCaptureError.frameAlreadyExists
+        }
+        try fileManager.moveItem(at: temporaryDirectory, to: frameDirectory)
+        committed = true
 
         return CaptureResult(
             frameIndex: frameIndex,
@@ -172,21 +188,45 @@ final class FrameCaptureService {
             depthBytes: frame.depthData.count,
             depthWidth: frame.depthWidth,
             depthHeight: frame.depthHeight,
-            confidenceBytes: frame.confidenceData.count
+            confidenceBytes: frame.confidenceData.count,
+            totalBytes: Int64(frame.rgbJPEG.count + frame.depthData.count + frame.confidenceData.count + metadata.count)
         )
+    }
+
+    func initializeSession(
+        sessionID: String,
+        startedAt: Date,
+        policy: RecordingPolicy
+    ) throws -> URL {
+        let sessionDirectory = try sessionDirectory(for: sessionID)
+        let metadata = SessionMetadata(
+            schemaVersion: 1,
+            sessionID: sessionID,
+            status: "recording",
+            startedAtUTC: ISO8601DateFormatter().string(from: startedAt),
+            endedAtUTC: nil,
+            durationSeconds: 0,
+            frameCount: 0,
+            totalBytes: 0,
+            captureMode: "keyframe",
+            recordingPolicy: policy.metadata,
+            sensor: SensorMetadata(depthUnit: "meters", coordinateSystem: "ARKit"),
+            validation: nil
+        )
+        try JSONEncoder().encodedSessionMetadata(metadata).write(
+            to: sessionDirectory.appendingPathComponent("session.json"),
+            options: .atomic
+        )
+        return sessionDirectory
     }
 
     func finalizeSession(
         sessionID: String,
-        frameCount: Int
+        frameCount: Int,
+        totalBytes: Int64,
+        startedAt: Date
     ) throws -> SessionFinalizationResult {
-        let documentsURL = fileManager.urls(
-            for: .documentDirectory,
-            in: .userDomainMask
-        )[0]
-        let sessionDirectory = documentsURL
-            .appendingPathComponent("Scans", isDirectory: true)
-            .appendingPathComponent("session_\(sessionID)", isDirectory: true)
+        let sessionDirectory = try sessionDirectory(for: sessionID)
         let framesDirectory = sessionDirectory.appendingPathComponent(
             "frames",
             isDirectory: true
@@ -209,9 +249,15 @@ final class FrameCaptureService {
         let metadata = SessionMetadata(
             schemaVersion: 1,
             sessionID: sessionID,
+            status: "completed",
+            startedAtUTC: ISO8601DateFormatter().string(from: startedAt),
+            endedAtUTC: ISO8601DateFormatter().string(from: Date()),
+            durationSeconds: max(0, Date().timeIntervalSince(startedAt)),
             frameCount: frameCount,
-            framesDirectory: "frames",
-            finalizedAtUTC: ISO8601DateFormatter().string(from: Date()),
+            totalBytes: totalBytes,
+            captureMode: "keyframe",
+            recordingPolicy: RecordingPolicy().metadata,
+            sensor: SensorMetadata(depthUnit: "meters", coordinateSystem: "ARKit"),
             validation: SessionValidation(
                 valid: true,
                 checkedFrames: checkedFrames,
@@ -229,6 +275,49 @@ final class FrameCaptureService {
             frameCount: frameCount,
             directory: sessionDirectory
         )
+    }
+
+    func deleteSession(sessionID: String) throws {
+        let directory = try sessionDirectory(for: sessionID)
+        guard fileManager.fileExists(atPath: directory.path) else { return }
+        try fileManager.removeItem(at: directory)
+    }
+
+    func incompleteSessionIDs() -> [String] {
+        let documentsURL = fileManager.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        let scansDirectory = documentsURL.appendingPathComponent("Scans", isDirectory: true)
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: scansDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) else { return [] }
+
+        return entries.compactMap { directory in
+            let metadataURL = directory.appendingPathComponent("session.json")
+            guard let data = try? Data(contentsOf: metadataURL),
+                  let metadata = try? JSONDecoder().decode(SessionMetadata.self, from: data),
+                  metadata.status == "recording" else { return nil }
+            return metadata.sessionID
+        }
+    }
+
+    private func sessionDirectory(for sessionID: String) throws -> URL {
+        let documentsURL = fileManager.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        )[0]
+        let scansDirectory = documentsURL.appendingPathComponent("Scans", isDirectory: true)
+        let sessionDirectory = scansDirectory.appendingPathComponent(
+            "session_\(sessionID)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(
+            at: sessionDirectory.appendingPathComponent("frames", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        return sessionDirectory
     }
 
     private func validateFrameDirectory(_ directory: URL) throws {
