@@ -129,7 +129,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         let newSessionID = UUID().uuidString.lowercased()
         let startDate = Date()
         do {
-            try captureService.initializeSession(
+            _ = try captureService.initializeSession(
                 sessionID: newSessionID,
                 startedAt: startDate,
                 policy: recordingPolicy

@@ -70,7 +70,7 @@ final class FrameCaptureService {
         ]
 
         guard let colorSpace,
-              let rgbJPEG = try? ciContext.jpegRepresentation(
+              let rgbJPEG = ciContext.jpegRepresentation(
                   of: rgbImage,
                   colorSpace: colorSpace,
                   options: jpegOptions

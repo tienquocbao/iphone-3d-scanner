@@ -14,8 +14,10 @@ struct StoragePolicy {
     func availableBytes(at url: URL) -> Int64? {
         let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]
         guard let values = try? url.resourceValues(forKeys: keys) else { return nil }
-        return values.volumeAvailableCapacityForImportantUsage
-            ?? values.volumeAvailableCapacity
+        if let importantCapacity = values.volumeAvailableCapacityForImportantUsage {
+            return importantCapacity
+        }
+        return values.volumeAvailableCapacity.map(Int64.init)
     }
 
     func canStart(at url: URL) -> Bool {
