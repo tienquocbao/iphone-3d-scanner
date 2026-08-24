@@ -3,4 +3,7 @@ channels:
   - defaults
 dependencies:
   - python=3.12
-prefix: C:\Users\tienq\.conda\envs\iphone3d
+  - numpy
+  - pip
+  - pip:
+      - open3d==0.19.0
