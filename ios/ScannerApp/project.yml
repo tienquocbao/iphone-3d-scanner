@@ -24,6 +24,9 @@ targets:
       properties:
         UILaunchScreen: {}
         NSCameraUsageDescription: "Camera access is required for 3D scanning."
+        NSLocalNetworkUsageDescription: "Local network access is required to transfer scan sessions to your Windows receiver."
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
 

@@ -303,7 +303,7 @@ final class FrameCaptureService {
         }
     }
 
-    private func sessionDirectory(for sessionID: String) throws -> URL {
+    func sessionDirectory(for sessionID: String) throws -> URL {
         let documentsURL = fileManager.urls(
             for: .documentDirectory,
             in: .userDomainMask

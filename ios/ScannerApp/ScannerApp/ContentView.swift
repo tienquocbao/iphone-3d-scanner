@@ -43,10 +43,25 @@ struct ContentView: View {
                     } else if manager.scanState == .finalizing {
                         ProgressView("Finalizing...")
                     } else if manager.scanState == .completed {
-                        Button("Delete Session", role: .destructive) {
-                            showingDeleteConfirmation = true
+                        TextField("Windows receiver URL", text: $manager.serverURLText)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .textFieldStyle(.roundedBorder)
+                        HStack {
+                            Button("Transfer and Delete") {
+                                manager.transferCompletedSession()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(manager.isTransferring)
+                            Button("Delete Session", role: .destructive) {
+                                showingDeleteConfirmation = true
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(manager.isTransferring)
                         }
-                        .buttonStyle(.bordered)
+                        Text("Trusted LAN only. The local session is deleted only after VERIFIED ACK.")
+                            .font(.caption2)
+                            .multilineTextAlignment(.center)
                     } else {
                         Button("Start Scan") {
                             manager.startScan()

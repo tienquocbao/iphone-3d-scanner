@@ -17,8 +17,11 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var capturedFrameCount = 0
     @Published var durationText = "00:00"
     @Published var storageText = "0 B"
+    @Published var serverURLText = TransferSettings.serverURL
+    @Published var isTransferring = false
 
     private let captureService = FrameCaptureService()
+    private lazy var transferService = SessionTransferService(captureService: captureService)
     private let recordingPolicy = RecordingPolicy()
     private let storagePolicy = StoragePolicy.default
     private let keyframeSelector = KeyframeSelector()
@@ -102,6 +105,44 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             }
         } catch {
             reportScanError("Delete failed: \(error.localizedDescription)")
+        }
+    }
+
+    func saveServerURL() {
+        TransferSettings.serverURL = serverURLText
+        serverURLText = TransferSettings.serverURL
+    }
+
+    func transferCompletedSession() {
+        guard scanState == .completed, !isTransferring else { return }
+        saveServerURL()
+        guard !TransferSettings.serverURL.isEmpty else {
+            captureStatus = "Enter the Windows receiver URL first"
+            return
+        }
+        let currentSessionID = sessionID
+        isTransferring = true
+        captureStatus = "Transferring session; local copy is protected..."
+        Task {
+            do {
+                let result = try await transferService.transfer(
+                    sessionID: currentSessionID,
+                    serverURLString: TransferSettings.serverURL
+                )
+                await MainActor.run {
+                    self.isTransferring = false
+                    self.scanState = .idle
+                    self.capturedFrameCount = 0
+                    self.durationText = "00:00"
+                    self.storageText = "0 B"
+                    self.captureStatus = "Transfer verified; deleted (result.fileCount) local files"
+                }
+            } catch {
+                await MainActor.run {
+                    self.isTransferring = false
+                    self.captureStatus = "Transfer failed; local session preserved: (error.localizedDescription)"
+                }
+            }
         }
     }
 
