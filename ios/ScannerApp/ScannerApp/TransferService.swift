@@ -201,7 +201,12 @@ final class SessionTransferService {
         guard fileManager.fileExists(atPath: sessionDirectory.path) else { throw TransferError.sessionNotFound }
         let manifest = try makeManifest(sessionID: sessionID, directory: sessionDirectory)
         let encoder = JSONEncoder()
-        let beginBody = try encoder.encode(manifest)
+        let beginBody: Data
+        do {
+            beginBody = try encoder.encode(manifest)
+        } catch {
+            throw TransferError(stage: .begin, message: "Cannot encode manifest", underlying: error)
+        }
         print("TRANSFER manifest files=\(manifest.files.count) payload_bytes=\(beginBody.count)")
         let begin = try await post(
             endpoint(serverURL, components: ["v1", "sessions", "begin"]),
@@ -239,7 +244,7 @@ final class SessionTransferService {
 
         let verified = try await post(
             endpoint(serverURL, components: ["v1", "sessions", sessionID, "finalize"]),
-            body: try encoder.encode(manifest),
+            body: try encodeFinalizeManifest(manifest, encoder: encoder),
             token: authToken,
             stage: .finalize,
             decode: VerifiedResponse.self
@@ -263,7 +268,13 @@ final class SessionTransferService {
               serverURL.host != nil else { throw TransferError.invalidServerURL }
         var request = baseRequest(endpoint(serverURL, components: ["api", "v1", "health"]), method: "GET", contentType: "application/json", token: authToken)
         request.httpBody = nil
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw TransferError(stage: .health, message: "URLSession health request failed", underlying: error)
+        }
         try validateHTTP(response, data: data, stage: .health)
         guard let object = try? JSONDecoder().decode(HealthResponse.self, from: data),
               object.protocolVersion == Self.protocolVersion,
@@ -271,7 +282,12 @@ final class SessionTransferService {
     }
 
     private func makeManifest(sessionID: String, directory: URL) throws -> TransferManifest {
-        let sessionData = try Data(contentsOf: directory.appendingPathComponent("session.json"))
+        let sessionData: Data
+        do {
+            sessionData = try Data(contentsOf: directory.appendingPathComponent("session.json"))
+        } catch {
+            throw TransferError(stage: .manifest, message: "Cannot read session.json", filePath: "session.json", underlying: error)
+        }
         guard let metadata = try? JSONDecoder().decode(SessionMetadata.self, from: sessionData),
               metadata.status == "completed",
               metadata.sessionID == sessionID
@@ -350,7 +366,7 @@ final class SessionTransferService {
     }
 
     private func validateHTTP(_ response: URLResponse, data: Data, stage: TransferStage, filePath: String? = nil) throws {
-        guard let http = response as? HTTPURLResponse else { throw TransferError.serverRejected("Invalid HTTP response") }
+        guard let http = response as? HTTPURLResponse else { throw TransferError.serverRejected("Invalid HTTP response", stage: stage, filePath: filePath) }
         guard (200..<300).contains(http.statusCode) else {
             throw TransferError(stage: stage, message: "Server rejected request", filePath: filePath, statusCode: http.statusCode, responseBody: boundedBody(data))
         }
@@ -367,5 +383,13 @@ final class SessionTransferService {
 
     private func manifestTotalBytes(_ manifest: TransferManifest) -> Int64 {
         manifest.files.reduce(Int64(0)) { total, file in total + file.size }
+    }
+
+    private func encodeFinalizeManifest(_ manifest: TransferManifest, encoder: JSONEncoder) throws -> Data {
+        do {
+            return try encoder.encode(manifest)
+        } catch {
+            throw TransferError(stage: .finalize, message: "Cannot encode finalize manifest", underlying: error)
+        }
     }
 }
