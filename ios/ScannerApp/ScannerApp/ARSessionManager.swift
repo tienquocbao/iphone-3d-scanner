@@ -23,6 +23,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var uploadedFrameCount = 0
     @Published var processedFrameCount = 0
     @Published var uploadBacklog = 0
+    @Published var failedLiveUploads = 0
     @Published var liveConnectionStatus = "NOT CONFIGURED"
 
     private let captureService = FrameCaptureService()
@@ -237,6 +238,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             liveUploadService = live
             liveStatusTask = Task { [weak self] in
                 var started = false
+                var retryDelay: UInt64 = 1
                 while !Task.isCancelled {
                     guard let self else { return }
                     do {
@@ -245,17 +247,29 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                             started = true
                         }
                         let status = try await live.status(sessionID: newSessionID)
+                        let queueStatus = await live.queueStatus()
                         await MainActor.run {
                             self.uploadedFrameCount = status.uploadedFiles / 4
                             self.processedFrameCount = status.processedFrames
-                            self.uploadBacklog = status.uploadBacklogFiles
+                            self.uploadBacklog = max(status.uploadBacklogFiles, queueStatus.backlog)
+                            self.failedLiveUploads = queueStatus.failed
                             self.liveConnectionStatus = "CONNECTED"
                         }
+                        retryDelay = 1
                     } catch {
                         started = false
+                        if let transferError = error as? TransferError, transferError.statusCode == 401 {
+                            await MainActor.run {
+                                self.liveConnectionStatus = "AUTHENTICATION FAILED; LOCAL CAPTURE CONTINUES"
+                            }
+                            return
+                        }
                         await MainActor.run {
                             self.liveConnectionStatus = "RECONNECTING; LOCAL CAPTURE CONTINUES"
                         }
+                        try? await Task.sleep(for: .seconds(retryDelay))
+                        retryDelay = min(retryDelay * 2, 5)
+                        continue
                     }
                     try? await Task.sleep(for: .seconds(1))
                 }
@@ -418,16 +432,11 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                 let startedAt = self.sessionStartedAt
                 self.captureStateLock.unlock()
                 if let live = self.liveUploadService {
-                    let enqueueComplete = DispatchSemaphore(value: 0)
-                    Task {
-                        await live.enqueueFrame(
-                            sessionID: currentSessionID,
-                            frameDirectory: result.directory,
-                            frameIndex: frameIndex
-                        )
-                        enqueueComplete.signal()
-                    }
-                    enqueueComplete.wait()
+                    live.enqueueFrame(
+                        sessionID: currentSessionID,
+                        frameDirectory: result.directory,
+                        frameIndex: frameIndex
+                    )
                 }
                 DispatchQueue.main.async {
                     self.capturedFrameCount = frameCount

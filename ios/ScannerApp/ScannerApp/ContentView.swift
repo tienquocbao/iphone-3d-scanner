@@ -40,6 +40,10 @@ struct ContentView: View {
                             .font(.caption2.monospaced())
                         Text("Windows \(manager.liveConnectionStatus)  Backlog \(manager.uploadBacklog)")
                             .font(.caption2.monospaced())
+                        if manager.failedLiveUploads > 0 {
+                            Text("Live upload failures \(manager.failedLiveUploads); final reconciliation will retry")
+                                .font(.caption2.monospaced())
+                        }
                     }
 
                     if manager.scanState == .recording {

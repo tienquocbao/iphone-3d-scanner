@@ -27,6 +27,11 @@ struct LiveReceiverStatus: Decodable, Sendable {
     }
 }
 
+struct LiveUploadQueueStatus: Sendable {
+    let backlog: Int
+    let failed: Int
+}
+
 actor LiveUploadQueue {
     static let defaultConcurrency = 4
 
@@ -35,6 +40,7 @@ actor LiveUploadQueue {
     private var pending: [LiveUploadItem] = []
     private var active = 0
     private var finished = false
+    private var failedPaths: [String] = []
 
     init(maxConcurrent: Int = LiveUploadQueue.defaultConcurrency, upload: @escaping @Sendable (LiveUploadItem) async throws -> Void) {
         self.maxConcurrent = max(1, maxConcurrent)
@@ -55,16 +61,20 @@ actor LiveUploadQueue {
         }
     }
 
-    func backlogCount() -> Int { pending.count + active }
+    func status() -> LiveUploadQueueStatus {
+        LiveUploadQueueStatus(backlog: pending.count + active, failed: failedPaths.count)
+    }
 
     private func schedule() {
         while active < maxConcurrent, !pending.isEmpty {
             let item = pending.removeFirst()
             active += 1
             Task {
+                var succeeded = false
                 for attempt in 0..<3 {
                     do {
                         try await upload(item)
+                        succeeded = true
                         break
                     } catch {
                         if attempt < 2 {
@@ -74,9 +84,16 @@ actor LiveUploadQueue {
                         // still fails after bounded retries stays safely on the iPhone.
                     }
                 }
+                if !succeeded {
+                    await recordFailure(item.relativePath)
+                }
                 await completed()
             }
         }
+    }
+
+    private func recordFailure(_ path: String) {
+        if !failedPaths.contains(path) { failedPaths.append(path) }
     }
 
     private func completed() {
@@ -90,6 +107,7 @@ final class LiveUploadService {
     private let session: URLSession
     private let token: String
     private let baseURL: URL
+    private let enqueueGroup = DispatchGroup()
     private lazy var queue = LiveUploadQueue { [weak self] item in
         guard let self else { return }
         try await self.upload(item)
@@ -110,18 +128,26 @@ final class LiveUploadService {
         request.httpBody = Data("{}".utf8)
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw TransferError(stage: .health, message: "Live receiver start failed", responseBody: String(data: data.prefix(8192), encoding: .utf8))
+            let status = (response as? HTTPURLResponse)?.statusCode
+            throw TransferError(stage: .health, message: status == 401 ? "Live receiver authentication failed" : "Live receiver start failed", statusCode: status, responseBody: String(data: data.prefix(8192), encoding: .utf8))
         }
     }
 
-    func enqueueFrame(sessionID: String, frameDirectory: URL, frameIndex: Int) async {
+    func enqueueFrame(sessionID: String, frameDirectory: URL, frameIndex: Int) {
+        enqueueGroup.enter()
+        Task { [weak self] in
+            defer { self?.enqueueGroup.leave() }
+            await self?.prepareAndEnqueueFrame(sessionID: sessionID, frameDirectory: frameDirectory, frameIndex: frameIndex)
+        }
+    }
+
+    private func prepareAndEnqueueFrame(sessionID: String, frameDirectory: URL, frameIndex: Int) async {
         let names = ["rgb.jpg", "depth.f32", "confidence.u8", "frame.json"]
         for name in names {
             let url = frameDirectory.appendingPathComponent(name)
             guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-                  let size = attributes[.size] as? NSNumber,
-                  let data = try? Data(contentsOf: url) else { continue }
-            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                  let size = attributes[.size] as? NSNumber else { continue }
+            guard let digest = try? streamedSHA256(url) else { continue }
             await queue.enqueue(LiveUploadItem(
                 sessionID: sessionID,
                 relativePath: String(format: "frames/%06d/%@", frameIndex, name),
@@ -133,29 +159,41 @@ final class LiveUploadService {
     }
 
     func finishAndWait() async {
+        await withCheckedContinuation { continuation in
+            enqueueGroup.notify(queue: .global()) { continuation.resume() }
+        }
         await queue.finishAndWait()
+    }
+
+    func queueStatus() async -> LiveUploadQueueStatus {
+        await queue.status()
     }
 
     func status(sessionID: String) async throws -> LiveReceiverStatus {
         let request = request(path: ["api", "v1", "live", "sessions", sessionID, "status"], method: "GET", contentType: "application/json")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw TransferError(stage: .health, message: "Live status request failed", responseBody: String(data: data.prefix(8192), encoding: .utf8))
+            throw TransferError(stage: .health, message: http.statusCode == 401 ? "Live receiver authentication failed" : "Live status request failed", statusCode: (response as? HTTPURLResponse)?.statusCode, responseBody: String(data: data.prefix(8192), encoding: .utf8))
         }
         return try JSONDecoder().decode(LiveReceiverStatus.self, from: data)
     }
 
     private func upload(_ item: LiveUploadItem) async throws {
-        var request = request(path: ["api", "v1", "live", "sessions", item.sessionID, "files", item.relativePath], method: "PUT", contentType: "application/octet-stream")
-        request.setValue(String(item.size), forHTTPHeaderField: "Content-Length")
-        request.setValue(item.sha256, forHTTPHeaderField: "X-File-SHA256")
+        let request = makeLiveFileRequest(item)
         let (data, response) = try await session.upload(for: request, fromFile: item.fileURL)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw TransferError(stage: .upload, message: "Live upload failed", filePath: item.relativePath, responseBody: String(data: data.prefix(8192), encoding: .utf8))
         }
     }
 
-    private func request(path: [String], method: String, contentType: String) -> URLRequest {
+    func makeLiveFileRequest(_ item: LiveUploadItem) -> URLRequest {
+        var request = request(path: ["api", "v1", "live", "sessions", item.sessionID, "files", item.relativePath], method: "PUT", contentType: "application/octet-stream")
+        request.setValue(String(item.size), forHTTPHeaderField: "Content-Length")
+        request.setValue(item.sha256, forHTTPHeaderField: "X-File-SHA256")
+        return request
+    }
+
+    func makeRequest(path: [String], method: String, contentType: String) -> URLRequest {
         let url = path.reduce(baseURL) { current, component in
             component.split(separator: "/").reduce(current) { $0.appendingPathComponent(String($1)) }
         }
@@ -163,7 +201,21 @@ final class LiveUploadService {
         request.httpMethod = method
         request.setValue("1", forHTTPHeaderField: "X-Protocol-Version")
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        if !token.isEmpty { request.setValue("Bearer (token)", forHTTPHeaderField: "Authorization") }
+        if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         return request
+    }
+
+    private func request(path: [String], method: String, contentType: String) -> URLRequest {
+        makeRequest(path: path, method: method, contentType: contentType)
+    }
+
+    private func streamedSHA256(_ url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
