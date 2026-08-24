@@ -24,3 +24,5 @@ targets:
       properties:
         UILaunchScreen: {}
         NSCameraUsageDescription: "Camera access is required for 3D scanning."
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true

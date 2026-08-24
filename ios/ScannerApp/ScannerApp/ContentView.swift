@@ -18,13 +18,25 @@ struct ContentView: View {
 
                 Spacer()
 
-                Text("Move the phone slowly")
-                    .font(.footnote)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.ultraThinMaterial)
-                    .clipShape(Capsule())
-                    .padding(.bottom, 30)
+                VStack(spacing: 10) {
+                    Text(manager.captureStatus)
+                        .font(.caption)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+
+                    Button("Capture Frame") {
+                        manager.requestCapture()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Text("Move the phone slowly")
+                        .font(.footnote)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                .padding(.bottom, 30)
             }
             .padding(.top, 8)
         }
