@@ -12,6 +12,10 @@ samples/*
 !samples/.gitkeep
 pointcloud_*.ply
 **/pointcloud_*.ply
+session_pointcloud_*.ply
+**/session_pointcloud_*.ply
+camera_trajectory*.csv
+**/camera_trajectory*.csv
 
 # macOS
 .DS_Store
