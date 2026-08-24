@@ -17,7 +17,6 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.iphone3dscanner
         SWIFT_VERSION: 5.0
-        SWIFT_ENABLE_EXPLICIT_MODULES: NO
         TARGETED_DEVICE_FAMILY: "1"
 
     info:

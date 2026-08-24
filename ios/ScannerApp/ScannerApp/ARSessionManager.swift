@@ -85,7 +85,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
 
         DispatchQueue.main.async {
             self.trackingStatus = tracking
-            self.depthResolution = "\(width) × \(height)"
+            self.depthResolution = "\(width) x \(height)"
             self.centerDepth = depth
             self.confidence = confidenceText
         }
@@ -105,16 +105,16 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         case .limited(let reason):
             switch reason {
             case .initializing:
-                return "LIMITED — initializing"
+                return "LIMITED - initializing"
 
             case .excessiveMotion:
-                return "LIMITED — excessive motion"
+                return "LIMITED - excessive motion"
 
             case .insufficientFeatures:
-                return "LIMITED — insufficient features"
+                return "LIMITED - insufficient features"
 
             case .relocalizing:
-                return "LIMITED — relocalizing"
+                return "LIMITED - relocalizing"
 
             @unknown default:
                 return "LIMITED"
