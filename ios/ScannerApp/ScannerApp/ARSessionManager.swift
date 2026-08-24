@@ -159,12 +159,12 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                     self.capturedFrameCount = 0
                     self.durationText = "00:00"
                     self.storageText = "0 B"
-                    self.captureStatus = "Transfer verified; deleted (result.fileCount) local files"
+                    self.captureStatus = "Transfer verified; deleted \(result.fileCount) local files"
                 }
             } catch {
                 await MainActor.run {
                     self.isTransferring = false
-                    self.captureStatus = "Transfer failed; local session preserved: (error.localizedDescription)"
+                    self.captureStatus = "Transfer failed - LOCAL SESSION PRESERVED\n\(error.localizedDescription)"
                 }
             }
         }

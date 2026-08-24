@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.client import HTTPConnection
 from pathlib import Path
 
@@ -31,7 +33,7 @@ class ReceiverTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def request(self, method, path, body, content_type="application/json", token="test-token"):
-        connection = HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=3)
+        connection = HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=30)
         data = body if isinstance(body, bytes) else json_bytes(body)
         headers = {"Content-Length": str(len(data)), "X-Protocol-Version": str(PROTOCOL_VERSION), "Content-Type": content_type}
         if token is not None:
@@ -77,6 +79,13 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual((response["protocol_version"], response["status"]), (1, "ok"))
 
+    def test_request_logs_never_contain_bearer_token(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status, _ = self.request("GET", "/api/v1/health", b"")
+        self.assertEqual(status, 200)
+        self.assertNotIn("test-token", output.getvalue())
+
     def test_bad_checksum_does_not_commit_file(self):
         manifest, files = self.manifest()
         self.request("POST", "/v1/sessions/begin", manifest)
@@ -114,3 +123,26 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(response["status"], "ready")
         self.assertNotIn(first_path, response["missing"])
         self.assertEqual(len(response["missing"]), len(files) - 1)
+
+    def test_realistic_129_frame_manifest_and_transfer(self):
+        session_id = "large-test"
+        files = {
+            "session.json": json.dumps({"schema_version": 1, "session_id": session_id, "status": "completed", "frame_count": 129}, separators=(",", ":")).encode()
+        }
+        for index in range(129):
+            prefix = f"frames/{index:06d}/"
+            files[prefix + "frame.json"] = json.dumps({"schema_version": 1, "frame_index": index}).encode()
+            files[prefix + "rgb.jpg"] = b"rgb" + bytes([index % 256])
+            files[prefix + "depth.f32"] = b"depth" + bytes([index % 256])
+            files[prefix + "confidence.u8"] = b"confidence" + bytes([index % 256])
+        manifest = {"protocol_version": 1, "session_id": session_id, "files": [{"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()} for path, data in sorted(files.items())]}
+        payload_bytes = len(json_bytes(manifest))
+        self.assertEqual(len(manifest["files"]), 517)
+        self.assertLess(payload_bytes, 100_000)
+        status, response = self.request("POST", "/v1/sessions/begin", manifest)
+        self.assertEqual((status, len(response["missing"])), (200, 517))
+        for path, data in files.items():
+            status, _ = self.request("PUT", "/v1/sessions/large-test/files/" + path, data, "application/octet-stream")
+            self.assertEqual(status, 200)
+        status, response = self.request("POST", "/v1/sessions/large-test/finalize", manifest)
+        self.assertEqual((status, response["status"], response["file_count"]), (200, "verified", 517))

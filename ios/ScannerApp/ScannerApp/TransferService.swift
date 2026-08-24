@@ -2,23 +2,58 @@ import CryptoKit
 import Foundation
 import Security
 
-enum TransferError: LocalizedError {
-    case invalidServerURL
-    case sessionNotFound
-    case invalidSession
-    case protocolMismatch
-    case serverRejected(String)
-    case invalidAcknowledgement
+enum TransferStage: String {
+    case health = "HEALTH"
+    case manifest = "MANIFEST"
+    case begin = "BEGIN"
+    case upload = "PUT"
+    case finalize = "FINALIZE"
+    case ackValidation = "ACK VALIDATION"
+}
+
+struct TransferError: LocalizedError {
+    let stage: TransferStage
+    let message: String
+    let filePath: String?
+    let statusCode: Int?
+    let responseBody: String?
+    let underlyingDescription: String?
+
+    init(
+        stage: TransferStage,
+        message: String,
+        filePath: String? = nil,
+        statusCode: Int? = nil,
+        responseBody: String? = nil,
+        underlying: Error? = nil
+    ) {
+        self.stage = stage
+        self.message = message
+        self.filePath = filePath
+        self.statusCode = statusCode
+        self.responseBody = responseBody
+        self.underlyingDescription = underlying?.localizedDescription
+    }
 
     var errorDescription: String? {
-        switch self {
-        case .invalidServerURL: return "Enter a valid Windows server URL, for example http://192.168.1.50:8765"
-        case .sessionNotFound: return "Completed scan session was not found"
-        case .invalidSession: return "Session metadata is not completed"
-        case .protocolMismatch: return "Windows receiver protocol version is unsupported"
-        case .serverRejected(let message): return message
-        case .invalidAcknowledgement: return "Windows receiver did not return a verified acknowledgement"
-        }
+        var lines = ["Stage: \(stage.rawValue)"]
+        if let filePath { lines.append("File: \(filePath)") }
+        if let statusCode { lines.append("HTTP: \(statusCode)") }
+        lines.append(message)
+        if let responseBody, !responseBody.isEmpty { lines.append(responseBody) }
+        if let underlyingDescription { lines.append(underlyingDescription) }
+        return lines.joined(separator: "\n")
+    }
+}
+
+extension TransferError {
+    static var invalidServerURL: TransferError { TransferError(stage: .health, message: "Invalid receiver URL") }
+    static var sessionNotFound: TransferError { TransferError(stage: .manifest, message: "Completed scan session was not found") }
+    static var invalidSession: TransferError { TransferError(stage: .manifest, message: "Session metadata is not completed") }
+    static var protocolMismatch: TransferError { TransferError(stage: .ackValidation, message: "Protocol or session ID mismatch") }
+    static var invalidAcknowledgement: TransferError { TransferError(stage: .ackValidation, message: "Invalid VERIFIED acknowledgement") }
+    static func serverRejected(_ message: String, stage: TransferStage = .health, filePath: String? = nil, statusCode: Int? = nil, responseBody: String? = nil, underlying: Error? = nil) -> TransferError {
+        TransferError(stage: stage, message: message, filePath: filePath, statusCode: statusCode, responseBody: responseBody, underlying: underlying)
     }
 }
 
@@ -95,12 +130,18 @@ private struct BeginResponse: Codable {
     let status: String
     let sessionID: String
     let missing: [String]?
+    let manifestSHA256: String?
+    let fileCount: Int?
+    let totalBytes: Int64?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case status
         case sessionID = "session_id"
         case missing
+        case manifestSHA256 = "manifest_sha256"
+        case fileCount = "file_count"
+        case totalBytes = "total_bytes"
     }
 }
 
@@ -109,12 +150,16 @@ private struct VerifiedResponse: Codable {
     let status: String
     let sessionID: String
     let fileCount: Int?
+    let manifestSHA256: String?
+    let totalBytes: Int64?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case status
         case sessionID = "session_id"
         case fileCount = "file_count"
+        case manifestSHA256 = "manifest_sha256"
+        case totalBytes = "total_bytes"
     }
 }
 
@@ -156,31 +201,39 @@ final class SessionTransferService {
         guard fileManager.fileExists(atPath: sessionDirectory.path) else { throw TransferError.sessionNotFound }
         let manifest = try makeManifest(sessionID: sessionID, directory: sessionDirectory)
         let encoder = JSONEncoder()
+        let beginBody = try encoder.encode(manifest)
+        print("TRANSFER manifest files=\(manifest.files.count) payload_bytes=\(beginBody.count)")
         let begin = try await post(
             endpoint(serverURL, components: ["v1", "sessions", "begin"]),
-            body: try encoder.encode(manifest),
+            body: beginBody,
             token: authToken,
+            stage: .begin,
             decode: BeginResponse.self
         )
         guard begin.protocolVersion == Self.protocolVersion, begin.sessionID == sessionID else {
-            throw TransferError.protocolMismatch
+            throw TransferError(stage: .begin, message: "Protocol or session ID mismatch in BEGIN response")
         }
         if begin.status == "verified" {
+            guard begin.manifestSHA256 == manifestHash(manifest),
+                  begin.fileCount == manifest.files.count,
+                  begin.totalBytes == manifest.files.reduce(Int64(0)) { $0 + $1.size }
+            else { throw TransferError(stage: .ackValidation, message: "Verified BEGIN response does not match manifest") }
             try captureService.deleteSession(sessionID: sessionID)
             return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
         }
-        guard begin.status == "ready" else { throw TransferError.invalidAcknowledgement }
+        guard begin.status == "ready" else { throw TransferError(stage: .begin, message: "Unexpected BEGIN status: \(begin.status)") }
 
         let filesByPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
         for relativePath in begin.missing ?? [] {
-            guard let expected = filesByPath[relativePath] else { throw TransferError.protocolMismatch }
+            guard let expected = filesByPath[relativePath] else { throw TransferError(stage: .upload, message: "Receiver requested a file not present in manifest", filePath: relativePath) }
             let localURL = sessionDirectory.appendingPathComponent(relativePath)
-            guard fileManager.fileExists(atPath: localURL.path) else { throw TransferError.sessionNotFound }
+            guard fileManager.fileExists(atPath: localURL.path) else { throw TransferError(stage: .upload, message: "Local file was not found", filePath: relativePath) }
             try await upload(
                 endpoint(serverURL, components: ["v1", "sessions", sessionID, "files", relativePath]),
                 fileURL: localURL,
                 expected: expected,
-                token: authToken
+                token: authToken,
+                stage: .upload
             )
         }
 
@@ -188,12 +241,16 @@ final class SessionTransferService {
             endpoint(serverURL, components: ["v1", "sessions", sessionID, "finalize"]),
             body: try encoder.encode(manifest),
             token: authToken,
+            stage: .finalize,
             decode: VerifiedResponse.self
         )
         guard verified.protocolVersion == Self.protocolVersion,
               verified.status == "verified",
-              verified.sessionID == sessionID
-        else { throw TransferError.invalidAcknowledgement }
+              verified.sessionID == sessionID,
+              verified.manifestSHA256 == manifestHash(manifest),
+              verified.fileCount == manifest.files.count,
+              verified.totalBytes == manifest.files.reduce(Int64(0)) { $0 + $1.size }
+        else { throw TransferError(stage: .ackValidation, message: "Missing or invalid VERIFIED acknowledgement") }
 
         try captureService.deleteSession(sessionID: sessionID)
         return TransferResult(sessionID: sessionID, fileCount: verified.fileCount ?? manifest.files.count)
@@ -207,7 +264,7 @@ final class SessionTransferService {
         var request = baseRequest(endpoint(serverURL, components: ["api", "v1", "health"]), method: "GET", contentType: "application/json", token: authToken)
         request.httpBody = nil
         let (data, response) = try await session.data(for: request)
-        try validateHTTP(response, data: data)
+        try validateHTTP(response, data: data, stage: .health)
         guard let object = try? JSONDecoder().decode(HealthResponse.self, from: data),
               object.protocolVersion == Self.protocolVersion,
               object.status == "ok" else { throw TransferError.invalidAcknowledgement }
@@ -231,7 +288,12 @@ final class SessionTransferService {
             let relative = fileURL.path
                 .replacingOccurrences(of: directory.path + "/", with: "")
                 .replacingOccurrences(of: "\\", with: "/")
-            let data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+            let data: Data
+            do {
+                data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+            } catch {
+                throw TransferError(stage: .manifest, message: "Cannot read file", filePath: relative, underlying: error)
+            }
             let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             files.append(TransferFile(path: relative, size: Int64(data.count), sha256: digest))
         }
@@ -239,7 +301,10 @@ final class SessionTransferService {
     }
 
     private func endpoint(_ base: URL, components: [String]) -> URL {
-        components.reduce(base) { $0.appendingPathComponent($1) }
+        components.reduce(base) { current, component in
+            component.split(separator: "/", omittingEmptySubsequences: true)
+                .reduce(current) { $0.appendingPathComponent(String($1)) }
+        }
     }
 
     private func baseRequest(_ url: URL, method: String, contentType: String, token: String) -> URLRequest {
@@ -253,26 +318,50 @@ final class SessionTransferService {
         return request
     }
 
-    private func post<T: Decodable>(_ url: URL, body: Data, token: String, decode: T.Type) async throws -> T {
+    private func post<T: Decodable>(_ url: URL, body: Data, token: String, stage: TransferStage, decode: T.Type) async throws -> T {
         var request = baseRequest(url, method: "POST", contentType: "application/json", token: token)
         request.httpBody = body
-        let (data, response) = try await session.data(for: request)
-        try validateHTTP(response, data: data)
-        return try JSONDecoder().decode(T.self, from: data)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw TransferError(stage: stage, message: "URLSession request failed", underlying: error)
+        }
+        try validateHTTP(response, data: data, stage: stage)
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw TransferError(stage: stage, message: "Cannot decode server response", responseBody: boundedBody(data), underlying: error)
+        }
     }
 
-    private func upload(_ url: URL, fileURL: URL, expected: TransferFile, token: String) async throws {
+    private func upload(_ url: URL, fileURL: URL, expected: TransferFile, token: String, stage: TransferStage) async throws {
         var request = baseRequest(url, method: "PUT", contentType: "application/octet-stream", token: token)
         request.setValue(String(expected.size), forHTTPHeaderField: "Content-Length")
-        let (data, response) = try await session.upload(for: request, fromFile: fileURL)
-        try validateHTTP(response, data: data)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.upload(for: request, fromFile: fileURL)
+        } catch {
+            throw TransferError(stage: stage, message: "URLSession upload failed", filePath: expected.path, underlying: error)
+        }
+        try validateHTTP(response, data: data, stage: stage, filePath: expected.path)
     }
 
-    private func validateHTTP(_ response: URLResponse, data: Data) throws {
+    private func validateHTTP(_ response: URLResponse, data: Data, stage: TransferStage, filePath: String? = nil) throws {
         guard let http = response as? HTTPURLResponse else { throw TransferError.serverRejected("Invalid HTTP response") }
         guard (200..<300).contains(http.statusCode) else {
-            let message = (try? JSONDecoder().decode([String: String].self, from: data)["error"]) ?? "Server rejected transfer"
-            throw TransferError.serverRejected(message)
+            throw TransferError(stage: stage, message: "Server rejected request", filePath: filePath, statusCode: http.statusCode, responseBody: boundedBody(data))
         }
+    }
+
+    private func boundedBody(_ data: Data) -> String {
+        String(data: data.prefix(8192), encoding: .utf8) ?? "<non-UTF8 response>"
+    }
+
+    private func manifestHash(_ manifest: TransferManifest) -> String {
+        let data = (try? JSONEncoder().encode(manifest)) ?? Data()
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

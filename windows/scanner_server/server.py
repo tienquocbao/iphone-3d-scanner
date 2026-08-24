@@ -90,11 +90,12 @@ class Receiver:
 
     def begin(self, payload: object) -> dict[str, object]:
         session_id, entries, manifest_hash = validate_manifest(payload)
+        print(f"BEGIN files={len(entries)} bytes={sum(int(entry['size']) for entry in entries.values())}", flush=True)
         final = self.completed(session_id)
         if final.is_dir() and (final / ".verified.json").is_file():
             verified = json.loads((final / ".verified.json").read_text(encoding="utf-8"))
             if verified.get("manifest_sha256") == manifest_hash:
-                return {"protocol_version": PROTOCOL_VERSION, "status": "verified", "session_id": session_id, "missing": []}
+                return {"protocol_version": PROTOCOL_VERSION, "status": "verified", "session_id": session_id, "missing": [], "manifest_sha256": verified.get("manifest_sha256"), "file_count": verified.get("file_count"), "total_bytes": verified.get("total_bytes")}
             raise TransferError("session already verified with a different manifest")
         staging = self.staging(session_id)
         staging.mkdir(parents=True, exist_ok=True)
@@ -169,6 +170,7 @@ class Receiver:
                 raise TransferError("completed session path is not a directory")
             shutil.rmtree(final)
         os.replace(staging, final)
+        print("FINALIZE validation=PASS", flush=True)
         return verified
 
     @staticmethod
@@ -185,6 +187,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, payload: object) -> None:
         data = json_bytes(payload)
+        summary = ""
+        if isinstance(payload, dict):
+            if payload.get("status") == "verified":
+                summary = " VERIFIED"
+            elif "missing" in payload and isinstance(payload["missing"], list):
+                summary = f" missing={len(payload['missing'])}"
+            elif "error" in payload:
+                summary = f" error={str(payload['error'])[:160].replace(chr(10), ' ')}"
+        print(f"RESPONSE status={status}{summary}", flush=True)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -219,16 +230,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            request_path = urlparse(self.path).path
+            print(f"REQUEST method=POST route={request_path}", flush=True)
             self._check_auth()
             self._check_protocol()
             path = urlparse(self.path).path.rstrip("/")
             payload = self._json_body()
             if path == "/v1/sessions/begin":
+                if isinstance(payload, dict):
+                    print(f"REQUEST stage=BEGIN session={payload.get('session_id', '<invalid>')}", flush=True)
                 self._send(HTTPStatus.OK, self.receiver.begin(payload))
             elif path.startswith("/v1/sessions/") and path.endswith("/finalize"):
                 path_session_id = safe_session_id(path.split("/")[3])
                 if not isinstance(payload, dict) or payload.get("session_id") != path_session_id:
                     raise TransferError("finalize path and manifest session_id differ")
+                print(f"REQUEST stage=FINALIZE session={path_session_id}", flush=True)
                 self._send(HTTPStatus.OK, self.receiver.finalize(payload))
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -241,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         try:
+            print(f"REQUEST method=PUT route={urlparse(self.path).path}", flush=True)
             self._check_auth()
             self._check_protocol()
             parts = [unquote(part) for part in urlparse(self.path).path.split("/")]
@@ -248,10 +265,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise TransferError("invalid file upload path")
             session_id = safe_session_id(parts[3])
             relative = "/".join(parts[5:])
+            print(f"REQUEST stage=UPLOAD session={session_id} path={relative}", flush=True)
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0:
                 raise TransferError("Content-Length is required")
-            self._send(HTTPStatus.OK, self.receiver.put_file(session_id, relative, length, self.rfile))
+            response = self.receiver.put_file(session_id, relative, length, self.rfile)
+            print(f"UPLOAD received={length} sha256=PASS", flush=True)
+            self._send(HTTPStatus.OK, response)
         except PermissionError:
             return
         except (TransferError, ValueError) as exc:
@@ -261,6 +281,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
+            print(f"REQUEST method=GET route={urlparse(self.path).path}", flush=True)
             self._check_auth()
             if urlparse(self.path).path != "/api/v1/health":
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
