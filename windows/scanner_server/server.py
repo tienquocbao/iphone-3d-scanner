@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -206,8 +207,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("X-Protocol-Version") != str(PROTOCOL_VERSION):
             raise TransferError("missing or unsupported X-Protocol-Version")
 
+    def _check_auth(self) -> None:
+        expected = getattr(self.server, "auth_token", None)
+        if not expected:
+            return
+        value = self.headers.get("Authorization", "")
+        supplied = value[7:] if value.startswith("Bearer ") else ""
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            self._send(HTTPStatus.UNAUTHORIZED, {"protocol_version": PROTOCOL_VERSION, "error": "authentication required"})
+            raise PermissionError("authentication failed")
+
     def do_POST(self) -> None:
         try:
+            self._check_auth()
             self._check_protocol()
             path = urlparse(self.path).path.rstrip("/")
             payload = self._json_body()
@@ -220,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, self.receiver.finalize(payload))
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except PermissionError:
+            return
         except TransferError as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
         except Exception as exc:
@@ -227,6 +241,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         try:
+            self._check_auth()
             self._check_protocol()
             parts = [unquote(part) for part in urlparse(self.path).path.split("/")]
             if len(parts) < 6 or parts[1:4] != ["v1", "sessions", parts[3]] or parts[4] != "files":
@@ -237,10 +252,22 @@ class Handler(BaseHTTPRequestHandler):
             if length < 0:
                 raise TransferError("Content-Length is required")
             self._send(HTTPStatus.OK, self.receiver.put_file(session_id, relative, length, self.rfile))
+        except PermissionError:
+            return
         except (TransferError, ValueError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
         except Exception as exc:
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
+
+    def do_GET(self) -> None:
+        try:
+            self._check_auth()
+            if urlparse(self.path).path != "/api/v1/health":
+                self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            self._send(HTTPStatus.OK, {"protocol_version": PROTOCOL_VERSION, "status": "ok", "auth_required": bool(getattr(self.server, "auth_token", None))})
+        except PermissionError:
+            return
 
     def log_message(self, format: str, *args) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -254,8 +281,10 @@ def main() -> int:
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.receiver = Receiver(args.storage_root)  # type: ignore[attr-defined]
+    server.auth_token = os.environ.get("IPHONE3D_RECEIVER_TOKEN", "").strip()  # type: ignore[attr-defined]
     print(f"Scanner receiver listening on http://{args.host}:{args.port}")
     print(f"Storage root: {server.receiver.storage_root}")  # type: ignore[attr-defined]
+    print(f"Authentication: {'enabled' if server.auth_token else 'DISABLED (trusted LAN mode)'}")  # type: ignore[attr-defined]
     try:
         server.serve_forever()
     except KeyboardInterrupt:

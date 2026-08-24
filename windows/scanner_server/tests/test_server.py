@@ -20,6 +20,7 @@ class ReceiverTests(unittest.TestCase):
         self.storage = Path(self.temp_dir.name) / "received"
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.receiver = Receiver(self.storage)
+        self.httpd.auth_token = "test-token"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
 
@@ -29,10 +30,12 @@ class ReceiverTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.temp_dir.cleanup()
 
-    def request(self, method, path, body, content_type="application/json"):
+    def request(self, method, path, body, content_type="application/json", token="test-token"):
         connection = HTTPConnection("127.0.0.1", self.httpd.server_port, timeout=3)
         data = body if isinstance(body, bytes) else json_bytes(body)
         headers = {"Content-Length": str(len(data)), "X-Protocol-Version": str(PROTOCOL_VERSION), "Content-Type": content_type}
+        if token is not None:
+            headers["Authorization"] = "Bearer " + token
         connection.request(method, path, data, headers)
         response = connection.getresponse()
         payload = json.loads(response.read().decode("utf-8"))
@@ -64,6 +67,15 @@ class ReceiverTests(unittest.TestCase):
         self.assertTrue((self.storage / "session_abc" / ".verified.json").is_file())
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual((status, response["status"]), (200, "verified"))
+
+    def test_health_requires_correct_bearer_token(self):
+        status, _ = self.request("GET", "/api/v1/health", b"", token=None)
+        self.assertEqual(status, 401)
+        status, _ = self.request("GET", "/api/v1/health", b"", token="wrong")
+        self.assertEqual(status, 401)
+        status, response = self.request("GET", "/api/v1/health", b"")
+        self.assertEqual(status, 200)
+        self.assertEqual((response["protocol_version"], response["status"]), (1, "ok"))
 
     def test_bad_checksum_does_not_commit_file(self):
         manifest, files = self.manifest()

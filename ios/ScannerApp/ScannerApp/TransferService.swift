@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Security
 
 enum TransferError: LocalizedError {
     case invalidServerURL
@@ -27,6 +28,47 @@ struct TransferSettings {
     static var serverURL: String {
         get { UserDefaults.standard.string(forKey: userDefaultsKey) ?? "" }
         set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: userDefaultsKey) }
+    }
+}
+
+enum KeychainStore {
+    private static let service = "com.local.iphone3dscanner.transfer"
+    private static let account = "receiver-bearer-token"
+
+    static func load() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
+    static func save(_ value: String) throws {
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let attributes: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var item = query
+            item[kSecValueData as String] = data
+            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else {
+                throw TransferError.serverRejected("Could not save receiver token in Keychain")
+            }
+        } else if status != errSecSuccess {
+            throw TransferError.serverRejected("Could not update receiver token in Keychain")
+        }
     }
 }
 
@@ -76,6 +118,16 @@ private struct VerifiedResponse: Codable {
     }
 }
 
+private struct HealthResponse: Codable {
+    let protocolVersion: Int
+    let status: String
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case status
+    }
+}
+
 struct TransferResult {
     let sessionID: String
     let fileCount: Int
@@ -93,7 +145,7 @@ final class SessionTransferService {
         self.session = session
     }
 
-    func transfer(sessionID: String, serverURLString: String) async throws -> TransferResult {
+    func transfer(sessionID: String, serverURLString: String, authToken: String) async throws -> TransferResult {
         guard let serverURL = URL(string: serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
               let scheme = serverURL.scheme,
               ["http", "https"].contains(scheme),
@@ -107,6 +159,7 @@ final class SessionTransferService {
         let begin = try await post(
             endpoint(serverURL, components: ["v1", "sessions", "begin"]),
             body: try encoder.encode(manifest),
+            token: authToken,
             decode: BeginResponse.self
         )
         guard begin.protocolVersion == Self.protocolVersion, begin.sessionID == sessionID else {
@@ -126,13 +179,15 @@ final class SessionTransferService {
             try await upload(
                 endpoint(serverURL, components: ["v1", "sessions", sessionID, "files", relativePath]),
                 fileURL: localURL,
-                expected: expected
+                expected: expected,
+                token: authToken
             )
         }
 
         let verified = try await post(
             endpoint(serverURL, components: ["v1", "sessions", sessionID, "finalize"]),
             body: try encoder.encode(manifest),
+            token: authToken,
             decode: VerifiedResponse.self
         )
         guard verified.protocolVersion == Self.protocolVersion,
@@ -142,6 +197,20 @@ final class SessionTransferService {
 
         try captureService.deleteSession(sessionID: sessionID)
         return TransferResult(sessionID: sessionID, fileCount: verified.fileCount ?? manifest.files.count)
+    }
+
+    func testConnection(serverURLString: String, authToken: String) async throws {
+        guard let serverURL = URL(string: serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = serverURL.scheme,
+              ["http", "https"].contains(scheme),
+              serverURL.host != nil else { throw TransferError.invalidServerURL }
+        var request = baseRequest(endpoint(serverURL, components: ["api", "v1", "health"]), method: "GET", contentType: "application/json", token: authToken)
+        request.httpBody = nil
+        let (data, response) = try await session.data(for: request)
+        try validateHTTP(response, data: data)
+        guard let object = try? JSONDecoder().decode(HealthResponse.self, from: data),
+              object.protocolVersion == Self.protocolVersion,
+              object.status == "ok" else { throw TransferError.invalidAcknowledgement }
     }
 
     private func makeManifest(sessionID: String, directory: URL) throws -> TransferManifest {
@@ -173,24 +242,27 @@ final class SessionTransferService {
         components.reduce(base) { $0.appendingPathComponent($1) }
     }
 
-    private func baseRequest(_ url: URL, method: String, contentType: String) -> URLRequest {
+    private func baseRequest(_ url: URL, method: String, contentType: String, token: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue(String(Self.protocolVersion), forHTTPHeaderField: "X-Protocol-Version")
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        if !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         return request
     }
 
-    private func post<T: Decodable>(_ url: URL, body: Data, decode: T.Type) async throws -> T {
-        var request = baseRequest(url, method: "POST", contentType: "application/json")
+    private func post<T: Decodable>(_ url: URL, body: Data, token: String, decode: T.Type) async throws -> T {
+        var request = baseRequest(url, method: "POST", contentType: "application/json", token: token)
         request.httpBody = body
         let (data, response) = try await session.data(for: request)
         try validateHTTP(response, data: data)
         return try JSONDecoder().decode(T.self, from: data)
     }
 
-    private func upload(_ url: URL, fileURL: URL, expected: TransferFile) async throws {
-        var request = baseRequest(url, method: "PUT", contentType: "application/octet-stream")
+    private func upload(_ url: URL, fileURL: URL, expected: TransferFile, token: String) async throws {
+        var request = baseRequest(url, method: "PUT", contentType: "application/octet-stream", token: token)
         request.setValue(String(expected.size), forHTTPHeaderField: "Content-Length")
         let (data, response) = try await session.upload(for: request, fromFile: fileURL)
         try validateHTTP(response, data: data)

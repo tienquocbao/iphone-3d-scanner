@@ -47,7 +47,14 @@ struct ContentView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .textFieldStyle(.roundedBorder)
+                        SecureField("Bearer token (Keychain)", text: $manager.authTokenText)
+                            .textFieldStyle(.roundedBorder)
                         HStack {
+                            Button("Test Connection") {
+                                manager.testConnection()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(manager.isTransferring)
                             Button("Transfer and Delete") {
                                 manager.transferCompletedSession()
                             }

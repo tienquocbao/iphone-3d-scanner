@@ -18,6 +18,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var durationText = "00:00"
     @Published var storageText = "0 B"
     @Published var serverURLText = TransferSettings.serverURL
+    @Published var authTokenText = ""
     @Published var isTransferring = false
 
     private let captureService = FrameCaptureService()
@@ -36,6 +37,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
 
     override init() {
         super.init()
+        authTokenText = KeychainStore.load() ?? ""
         session.delegate = self
         let incompleteCount = captureService.incompleteSessionIDs().count
         if incompleteCount > 0 {
@@ -113,9 +115,30 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         serverURLText = TransferSettings.serverURL
     }
 
+    func testConnection() {
+        saveServerURL()
+        do { try KeychainStore.save(authTokenText) } catch {
+            captureStatus = error.localizedDescription
+            return
+        }
+        captureStatus = "Testing receiver..."
+        Task {
+            do {
+                try await transferService.testConnection(serverURLString: TransferSettings.serverURL, authToken: authTokenText)
+                await MainActor.run { self.captureStatus = "Receiver connection verified" }
+            } catch {
+                await MainActor.run { self.captureStatus = "Connection failed: \(error.localizedDescription)" }
+            }
+        }
+    }
+
     func transferCompletedSession() {
         guard scanState == .completed, !isTransferring else { return }
         saveServerURL()
+        do { try KeychainStore.save(authTokenText) } catch {
+            captureStatus = error.localizedDescription
+            return
+        }
         guard !TransferSettings.serverURL.isEmpty else {
             captureStatus = "Enter the Windows receiver URL first"
             return
@@ -127,7 +150,8 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             do {
                 let result = try await transferService.transfer(
                     sessionID: currentSessionID,
-                    serverURLString: TransferSettings.serverURL
+                    serverURLString: TransferSettings.serverURL,
+                    authToken: authTokenText
                 )
                 await MainActor.run {
                     self.isTransferring = false
