@@ -62,11 +62,17 @@ actor LiveUploadQueue {
             let item = pending.removeFirst()
             active += 1
             Task {
-                do {
-                    try await upload(item)
-                } catch {
-                    // Final BEGIN reconciliation remains authoritative. A failed live PUT
-                    // is intentionally not fatal to local capture.
+                for attempt in 0..<3 {
+                    do {
+                        try await upload(item)
+                        break
+                    } catch {
+                        if attempt < 2 {
+                            try? await Task.sleep(for: .seconds(1))
+                        }
+                        // Final BEGIN reconciliation remains authoritative. A file that
+                        // still fails after bounded retries stays safely on the iPhone.
+                    }
                 }
                 await completed()
             }
