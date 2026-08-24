@@ -216,7 +216,7 @@ final class SessionTransferService {
         if begin.status == "verified" {
             guard begin.manifestSHA256 == manifestHash(manifest),
                   begin.fileCount == manifest.files.count,
-                  begin.totalBytes == manifest.files.reduce(Int64(0)) { $0 + $1.size }
+                  begin.totalBytes == manifestTotalBytes(manifest)
             else { throw TransferError(stage: .ackValidation, message: "Verified BEGIN response does not match manifest") }
             try captureService.deleteSession(sessionID: sessionID)
             return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
@@ -249,7 +249,7 @@ final class SessionTransferService {
               verified.sessionID == sessionID,
               verified.manifestSHA256 == manifestHash(manifest),
               verified.fileCount == manifest.files.count,
-              verified.totalBytes == manifest.files.reduce(Int64(0)) { $0 + $1.size }
+              verified.totalBytes == manifestTotalBytes(manifest)
         else { throw TransferError(stage: .ackValidation, message: "Missing or invalid VERIFIED acknowledgement") }
 
         try captureService.deleteSession(sessionID: sessionID)
@@ -363,5 +363,9 @@ final class SessionTransferService {
     private func manifestHash(_ manifest: TransferManifest) -> String {
         let data = (try? JSONEncoder().encode(manifest)) ?? Data()
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func manifestTotalBytes(_ manifest: TransferManifest) -> Int64 {
+        manifest.files.reduce(Int64(0)) { total, file in total + file.size }
     }
 }
