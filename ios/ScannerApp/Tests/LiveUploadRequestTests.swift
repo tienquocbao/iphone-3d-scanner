@@ -64,4 +64,16 @@ final class LiveUploadRequestTests: XCTestCase {
         XCTAssertEqual(status.backlog, 0)
         XCTAssertEqual(status.failed, 1)
     }
+
+    func testReadyFramesDriveCompleteUploadedFrameCount() {
+        let status = LiveReceiverStatus(
+            state: "recording",
+            uploadedFiles: 7,
+            uploadedBytes: 100,
+            readyFrames: 1,
+            processedFrames: 0,
+            uploadBacklogFiles: 3
+        )
+        XCTAssertEqual(ARSessionManager.completeUploadedFrameCount(for: status), 1)
+    }
 }

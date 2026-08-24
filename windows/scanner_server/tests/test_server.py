@@ -6,15 +6,18 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from http.client import HTTPConnection
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from server import PROTOCOL_VERSION, Handler, Receiver, ThreadingHTTPServer, json_bytes
+from server import LiveSession, PROTOCOL_VERSION, Handler, Receiver, ThreadingHTTPServer, json_bytes
 
 
 class ReceiverTests(unittest.TestCase):
@@ -233,6 +236,62 @@ class ReceiverTests(unittest.TestCase):
             "application/octet-stream",
         )
         self.assertEqual(status, 400)
+
+    def test_live_processing_failure_blocks_and_retries_same_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory)
+            for index in (0, 1):
+                frame = staging / "frames" / f"{index:06d}"
+                frame.mkdir(parents=True)
+                for name in ("rgb.jpg", "depth.f32", "confidence.u8", "frame.json"):
+                    (frame / name).write_bytes(b"x")
+
+            loaded_paths = []
+
+            def load_frame(path):
+                loaded_paths.append(path.name)
+                if len(loaded_paths) == 1:
+                    raise ValueError("synthetic processing failure")
+                return object()
+
+            class FakeVolume:
+                def integrate(self, rgbd, intrinsic, extrinsic):
+                    return None
+
+            def prepare(*_args):
+                return SimpleNamespace(rgbd=object(), intrinsic=object(), extrinsic=object())
+
+            with mock.patch("frame_io.load_frame", side_effect=load_frame), \
+                    mock.patch("geometry.depth_to_world_points", return_value=([1, 2], None, None)), \
+                    mock.patch("tsdf.prepare_tsdf_frame", side_effect=prepare), \
+                    mock.patch("open3d.pipelines.integration.ScalableTSDFVolume", return_value=FakeVolume()):
+                live = LiveSession("processing-test", staging)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    status = live.snapshot()
+                    if status["processing_failed_frame"] == 0:
+                        break
+                    time.sleep(0.01)
+                status = live.snapshot()
+                self.assertEqual(status["processed_frames"], 0)
+                self.assertEqual(status["next_processing_frame"], 0)
+                self.assertEqual(status["processing_failed_frame"], 0)
+                self.assertIn("synthetic processing failure", status["processing_error"])
+
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    if live.snapshot()["processed_frames"] == 2:
+                        break
+                    time.sleep(0.02)
+                live.stop()
+                live.worker.join(timeout=2)
+
+            self.assertEqual(loaded_paths[:3], ["000000", "000000", "000001"])
+            status = live.snapshot()
+            self.assertEqual(status["processed_frames"], 2)
+            self.assertEqual(status["last_frame_index"], 1)
+            self.assertIsNone(status["processing_failed_frame"])
+            self.assertIsNone(status["processing_error"])
 
     def test_final_begin_reconciles_live_staged_frame_files(self):
         manifest, files = self.manifest()

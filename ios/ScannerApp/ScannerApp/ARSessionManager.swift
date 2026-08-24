@@ -5,6 +5,10 @@ import UIKit
 
 final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
 
+    static func completeUploadedFrameCount(for status: LiveReceiverStatus) -> Int {
+        status.readyFrames
+    }
+
     let session = ARSession()
 
     @Published var lidarSupported = false
@@ -249,7 +253,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                         let status = try await live.status(sessionID: newSessionID)
                         let queueStatus = await live.queueStatus()
                         await MainActor.run {
-                            self.uploadedFrameCount = status.uploadedFiles / 4
+                            self.uploadedFrameCount = Self.completeUploadedFrameCount(for: status)
                             self.processedFrameCount = status.processedFrames
                             self.uploadBacklog = max(status.uploadBacklogFiles, queueStatus.backlog)
                             self.failedLiveUploads = queueStatus.failed

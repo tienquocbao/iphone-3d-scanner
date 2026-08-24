@@ -99,6 +99,10 @@ class LiveSession:
         self.uploaded_bytes = 0
         self.ready_frames = 0
         self.processed_frames = 0
+        self.processing_failed_frame: int | None = None
+        self.processing_error: str | None = None
+        self.processing_retry_count = 0
+        self.processing_retry_at = 0.0
         self.raw_points = 0
         self.last_frame_index: int | None = None
         self.processing_fps = 0.0
@@ -126,6 +130,9 @@ class LiveSession:
                 "ready_frames": self.ready_frames,
                 "processed_frames": self.processed_frames,
                 "next_processing_frame": self.processed_frames,
+                "processing_failed_frame": self.processing_failed_frame,
+                "processing_error": self.processing_error,
+                "processing_retry_count": self.processing_retry_count,
                 "upload_backlog_files": max(0, self.uploaded_files - self.processed_frames * 4),
                 "raw_points": self.raw_points,
                 "last_frame_index": self.last_frame_index,
@@ -160,6 +167,10 @@ class LiveSession:
                     if self.stop_requested:
                         return
                     continue
+                retry_wait = self.processing_retry_at - time.monotonic()
+                if self.processing_failed_frame == next_index and retry_wait > 0:
+                    self.condition.wait(timeout=retry_wait)
+                    continue
             try:
                 from frame_io import load_frame
                 from geometry import depth_to_world_points
@@ -180,6 +191,10 @@ class LiveSession:
                 with self.condition:
                     self.raw_points += len(points)
                     self.processed_frames += 1
+                    self.processing_failed_frame = None
+                    self.processing_error = None
+                    self.processing_retry_count = 0
+                    self.processing_retry_at = 0.0
                     self.last_frame_index = next_index
                     elapsed = max(time.monotonic() - started, 1e-6)
                     self.processing_fps = self.processed_frames / elapsed
@@ -188,10 +203,14 @@ class LiveSession:
                     preview_path = self.staging.parent / ".live" / self.session_id / "preview_pointcloud.ply"
                     write_point_cloud(preview_path, self.tsdf_volume.extract_point_cloud())
             except Exception as exc:
-                print(f"LIVE processing failed session={self.session_id} frame={next_index}: {exc}", flush=True)
+                error = str(exc).strip() or exc.__class__.__name__
+                print(f"LIVE processing failed session={self.session_id} frame={next_index}: {error}", flush=True)
                 with self.condition:
-                    self.processed_frames += 1
-                    self.last_frame_index = next_index
+                    self.processing_failed_frame = next_index
+                    self.processing_error = error[:512]
+                    self.processing_retry_count += 1
+                    self.processing_retry_at = time.monotonic() + min(2 ** (self.processing_retry_count - 1), 5)
+                    self.condition.notify_all()
 
 
 def safe_relative_path(value: object) -> str:
