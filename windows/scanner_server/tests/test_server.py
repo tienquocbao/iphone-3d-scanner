@@ -66,9 +66,17 @@ class ReceiverTests(unittest.TestCase):
         status, response = self.request("POST", "/v1/sessions/abc/finalize", manifest)
         self.assertEqual(status, 200)
         self.assertEqual(response["status"], "verified")
+        self.assertEqual(response["verified_file_count"], 5)
+        self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
+        self.assertNotIn("file_count", response)
+        self.assertNotIn("total_bytes", response)
         self.assertTrue((self.storage / "session_abc" / ".verified.json").is_file())
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual((status, response["status"]), (200, "verified"))
+        self.assertEqual(response["verified_file_count"], 5)
+        self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
+        self.assertNotIn("file_count", response)
+        self.assertNotIn("total_bytes", response)
 
     def test_health_requires_correct_bearer_token(self):
         status, _ = self.request("GET", "/api/v1/health", b"", token=None)
@@ -132,6 +140,29 @@ class ReceiverTests(unittest.TestCase):
         self.assertNotIn(first_path, response["missing"])
         self.assertEqual(len(response["missing"]), len(files) - 1)
 
+    def test_legacy_verified_receipt_is_normalized_on_retry(self):
+        manifest, files = self.manifest()
+        self.request("POST", "/v1/sessions/begin", manifest)
+        for path, data in files.items():
+            self.request("PUT", "/v1/sessions/abc/files/" + path, data, "application/octet-stream")
+        status, first = self.request("POST", "/v1/sessions/abc/finalize", manifest)
+        self.assertEqual(status, 200)
+        receipt_path = self.storage / "session_abc" / ".verified.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["file_count"] = receipt.pop("verified_file_count")
+        receipt["total_bytes"] = receipt.pop("verified_total_bytes")
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        status, response = self.request("POST", "/v1/sessions/begin", manifest)
+        self.assertEqual((status, response["status"]), (200, "verified"))
+        self.assertEqual(response["verified_file_count"], first["verified_file_count"])
+        self.assertEqual(response["verified_total_bytes"], first["verified_total_bytes"])
+        self.assertNotIn("file_count", response)
+        self.assertNotIn("total_bytes", response)
+        normalized = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertIn("verified_file_count", normalized)
+        self.assertIn("verified_total_bytes", normalized)
+
     def test_realistic_129_frame_manifest_and_transfer(self):
         session_id = "large-test"
         files = {
@@ -153,4 +184,5 @@ class ReceiverTests(unittest.TestCase):
             status, _ = self.request("PUT", "/v1/sessions/large-test/files/" + path, data, "application/octet-stream")
             self.assertEqual(status, 200)
         status, response = self.request("POST", "/v1/sessions/large-test/finalize", manifest)
-        self.assertEqual((status, response["status"], response["file_count"]), (200, "verified", 517))
+        self.assertEqual((status, response["status"], response["verified_file_count"]), (200, "verified", 517))
+        self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))

@@ -42,6 +42,43 @@ def safe_session_id(value: object) -> str:
     return value
 
 
+def canonical_verified_ack(
+    session_id: str,
+    manifest_hash: str,
+    file_count: int,
+    total_bytes: int,
+) -> dict[str, object]:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "status": "verified",
+        "session_id": session_id,
+        "manifest_sha256": manifest_hash,
+        "verified_file_count": file_count,
+        "verified_total_bytes": total_bytes,
+    }
+
+
+def load_verified_receipt(path: Path, session_id: str, manifest_hash: str) -> dict[str, object]:
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TransferError("invalid verified receipt") from exc
+    if not isinstance(receipt, dict):
+        raise TransferError("invalid verified receipt")
+    if (
+        receipt.get("protocol_version") != PROTOCOL_VERSION
+        or receipt.get("status") != "verified"
+        or receipt.get("session_id") != session_id
+        or receipt.get("manifest_sha256") != manifest_hash
+    ):
+        raise TransferError("verified receipt does not match manifest")
+    file_count = receipt.get("verified_file_count", receipt.get("file_count"))
+    total_bytes = receipt.get("verified_total_bytes", receipt.get("total_bytes"))
+    if type(file_count) is not int or file_count < 0 or type(total_bytes) is not int or total_bytes < 0:
+        raise TransferError("verified receipt has invalid totals")
+    return canonical_verified_ack(session_id, manifest_hash, file_count, total_bytes)
+
+
 def safe_relative_path(value: object) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise TransferError("invalid relative file path")
@@ -101,10 +138,9 @@ class Receiver:
         print(f"BEGIN files={len(entries)} bytes={sum(int(entry['size']) for entry in entries.values())}", flush=True)
         final = self.completed(session_id)
         if final.is_dir() and (final / ".verified.json").is_file():
-            verified = json.loads((final / ".verified.json").read_text(encoding="utf-8"))
-            if verified.get("manifest_sha256") == manifest_hash:
-                return {"protocol_version": PROTOCOL_VERSION, "status": "verified", "session_id": session_id, "missing": [], "manifest_sha256": verified.get("manifest_sha256"), "file_count": verified.get("file_count"), "total_bytes": verified.get("total_bytes")}
-            raise TransferError("session already verified with a different manifest")
+            verified = load_verified_receipt(final / ".verified.json", session_id, manifest_hash)
+            (final / ".verified.json").write_text(json.dumps(verified, indent=2), encoding="utf-8")
+            return {**verified, "missing": []}
         staging = self.staging(session_id)
         staging.mkdir(parents=True, exist_ok=True)
         manifest = {"protocol_version": PROTOCOL_VERSION, "session_id": session_id, "files": [{"path": path, **entries[path]} for path in sorted(entries)], "manifest_sha256": manifest_hash}
@@ -170,7 +206,12 @@ class Receiver:
             required = {prefix + name for name in ("rgb.jpg", "depth.f32", "confidence.u8", "frame.json")}
             if not required.issubset(entries):
                 raise TransferError(f"manifest is missing required files for frame {index:06d}")
-        verified = {"protocol_version": PROTOCOL_VERSION, "status": "verified", "session_id": session_id, "manifest_sha256": manifest_hash, "file_count": len(entries), "total_bytes": sum(int(e["size"]) for e in entries.values())}
+        verified = canonical_verified_ack(
+            session_id,
+            manifest_hash,
+            len(entries),
+            sum(int(e["size"]) for e in entries.values()),
+        )
         (staging / ".verified.json").write_text(json.dumps(verified, indent=2), encoding="utf-8")
         final = self.completed(session_id)
         if final.exists():

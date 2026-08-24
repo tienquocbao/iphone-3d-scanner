@@ -165,8 +165,8 @@ private struct BeginResponse: Codable {
     let sessionID: String
     let missing: [String]?
     let manifestSHA256: String?
-    let fileCount: Int?
-    let totalBytes: Int64?
+    let verifiedFileCount: Int?
+    let verifiedTotalBytes: Int64?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -174,26 +174,26 @@ private struct BeginResponse: Codable {
         case sessionID = "session_id"
         case missing
         case manifestSHA256 = "manifest_sha256"
-        case fileCount = "file_count"
-        case totalBytes = "total_bytes"
+        case verifiedFileCount = "verified_file_count"
+        case verifiedTotalBytes = "verified_total_bytes"
     }
 }
 
-private struct VerifiedResponse: Codable {
+struct VerifiedResponse: Codable {
     let protocolVersion: Int
     let status: String
     let sessionID: String
-    let fileCount: Int?
-    let manifestSHA256: String?
-    let totalBytes: Int64?
+    let verifiedFileCount: Int
+    let manifestSHA256: String
+    let verifiedTotalBytes: Int64
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case status
         case sessionID = "session_id"
-        case fileCount = "file_count"
+        case verifiedFileCount = "verified_file_count"
         case manifestSHA256 = "manifest_sha256"
-        case totalBytes = "total_bytes"
+        case verifiedTotalBytes = "verified_total_bytes"
     }
 }
 
@@ -254,8 +254,8 @@ final class SessionTransferService {
         }
         if begin.status == "verified" {
             guard begin.manifestSHA256 == manifestHash(manifest),
-                  begin.fileCount == manifest.files.count,
-                  begin.totalBytes == manifestTotalBytes(manifest)
+                  begin.verifiedFileCount == manifest.files.count,
+                  begin.verifiedTotalBytes == manifestTotalBytes(manifest)
             else { throw TransferError(stage: .ackValidation, message: "Verified BEGIN response does not match manifest") }
             try captureService.deleteSession(sessionID: sessionID)
             return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
@@ -283,16 +283,17 @@ final class SessionTransferService {
             stage: .finalize,
             decode: VerifiedResponse.self
         )
-        guard verified.protocolVersion == Self.protocolVersion,
-              verified.status == "verified",
-              verified.sessionID == sessionID,
-              verified.manifestSHA256 == manifestHash(manifest),
-              verified.fileCount == manifest.files.count,
-              verified.totalBytes == manifestTotalBytes(manifest)
+        guard Self.isValidVerifiedAcknowledgement(
+            verified,
+            sessionID: sessionID,
+            manifestHash: manifestHash(manifest),
+            fileCount: manifest.files.count,
+            totalBytes: manifestTotalBytes(manifest)
+        )
         else { throw TransferError(stage: .ackValidation, message: "Missing or invalid VERIFIED acknowledgement") }
 
         try captureService.deleteSession(sessionID: sessionID)
-        return TransferResult(sessionID: sessionID, fileCount: verified.fileCount ?? manifest.files.count)
+        return TransferResult(sessionID: sessionID, fileCount: verified.verifiedFileCount)
     }
 
     func testConnection(serverURLString: String, authToken: String) async throws {
@@ -425,6 +426,21 @@ final class SessionTransferService {
 
     private func manifestTotalBytes(_ manifest: TransferManifest) -> Int64 {
         manifest.files.reduce(Int64(0)) { total, file in total + file.size }
+    }
+
+    static func isValidVerifiedAcknowledgement(
+        _ response: VerifiedResponse,
+        sessionID: String,
+        manifestHash: String,
+        fileCount: Int,
+        totalBytes: Int64
+    ) -> Bool {
+        response.protocolVersion == protocolVersion
+            && response.status == "verified"
+            && response.sessionID == sessionID
+            && response.manifestSHA256 == manifestHash
+            && response.verifiedFileCount == fileCount
+            && response.verifiedTotalBytes == totalBytes
     }
 
     private func encodeFinalizeManifest(_ manifest: TransferManifest, encoder: JSONEncoder) throws -> Data {
