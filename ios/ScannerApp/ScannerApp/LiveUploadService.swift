@@ -172,8 +172,9 @@ final class LiveUploadService {
     func status(sessionID: String) async throws -> LiveReceiverStatus {
         let request = request(path: ["api", "v1", "live", "sessions", sessionID, "status"], method: "GET", contentType: "application/json")
         let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw TransferError(stage: .health, message: http.statusCode == 401 ? "Live receiver authentication failed" : "Live status request failed", statusCode: (response as? HTTPURLResponse)?.statusCode, responseBody: String(data: data.prefix(8192), encoding: .utf8))
+        let statusCode = (response as? HTTPURLResponse)?.statusCode
+        guard let statusCode, (200..<300).contains(statusCode) else {
+            throw TransferError(stage: .health, message: statusCode == 401 ? "Live receiver authentication failed" : "Live status request failed", statusCode: statusCode, responseBody: String(data: data.prefix(8192), encoding: .utf8))
         }
         return try JSONDecoder().decode(LiveReceiverStatus.self, from: data)
     }
