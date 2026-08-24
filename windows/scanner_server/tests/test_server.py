@@ -95,3 +95,22 @@ class ReceiverTests(unittest.TestCase):
         bad["files"] = [{"path": "../escape", "size": 0, "sha256": "0" * 64}]
         status, response = self.request("POST", "/v1/sessions/begin", bad)
         self.assertEqual(status, 400)
+
+    def test_resume_after_receiver_restart_returns_only_missing_files(self):
+        manifest, files = self.manifest()
+        self.request("POST", "/v1/sessions/begin", manifest)
+        first_path, first_data = next(iter(files.items()))
+        self.request("PUT", "/v1/sessions/abc/files/" + first_path, first_data, "application/octet-stream")
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.receiver = Receiver(self.storage)
+        self.httpd.auth_token = "test-token"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        status, response = self.request("POST", "/v1/sessions/begin", manifest)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["status"], "ready")
+        self.assertNotIn(first_path, response["missing"])
+        self.assertEqual(len(response["missing"]), len(files) - 1)
