@@ -113,6 +113,40 @@ private struct TransferFile: Codable {
     let sha256: String
 }
 
+enum TransferPath {
+    static func canonicalRelativePath(sessionRoot: URL, fileURL: URL) throws -> String {
+        let root = sessionRoot.standardizedFileURL
+        let file = fileURL.standardizedFileURL
+        guard root.isFileURL, file.isFileURL else {
+            throw TransferError(stage: .manifest, message: "Session paths must be file URLs")
+        }
+
+        let rootComponents = root.pathComponents
+        let fileComponents = file.pathComponents
+        guard fileComponents.count > rootComponents.count,
+              Array(fileComponents.prefix(rootComponents.count)) == rootComponents else {
+            throw TransferError(stage: .manifest, message: "File is outside the scan session", filePath: file.path)
+        }
+
+        let relativeComponents = Array(fileComponents.dropFirst(rootComponents.count))
+        guard !relativeComponents.isEmpty else {
+            throw TransferError(stage: .manifest, message: "Session file path is empty")
+        }
+        for component in relativeComponents {
+            guard !component.isEmpty, component != ".", component != "..",
+                  !component.contains("/"), !component.contains("\\") else {
+                throw TransferError(stage: .manifest, message: "Invalid session file path", filePath: component)
+            }
+        }
+        return relativeComponents.joined(separator: "/")
+    }
+
+    static func localURL(sessionRoot: URL, relativePath: String) -> URL {
+        relativePath.split(separator: "/", omittingEmptySubsequences: false)
+            .reduce(sessionRoot) { $0.appendingPathComponent(String($1), isDirectory: false) }
+    }
+}
+
 private struct TransferManifest: Codable {
     let protocolVersion: Int
     let sessionID: String
@@ -231,7 +265,7 @@ final class SessionTransferService {
         let filesByPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
         for relativePath in begin.missing ?? [] {
             guard let expected = filesByPath[relativePath] else { throw TransferError(stage: .upload, message: "Receiver requested a file not present in manifest", filePath: relativePath) }
-            let localURL = sessionDirectory.appendingPathComponent(relativePath)
+            let localURL = TransferPath.localURL(sessionRoot: sessionDirectory, relativePath: relativePath)
             guard fileManager.fileExists(atPath: localURL.path) else { throw TransferError(stage: .upload, message: "Local file was not found", filePath: relativePath) }
             try await upload(
                 endpoint(serverURL, components: ["v1", "sessions", sessionID, "files", relativePath]),
@@ -301,9 +335,17 @@ final class SessionTransferService {
         var files: [TransferFile] = []
         for case let fileURL as URL in enumerator {
             guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-            let relative = fileURL.path
-                .replacingOccurrences(of: directory.path + "/", with: "")
-                .replacingOccurrences(of: "\\", with: "/")
+            let relative = try TransferPath.canonicalRelativePath(sessionRoot: directory, fileURL: fileURL)
+            let components = relative.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            let isSessionMetadata = relative == "session.json"
+            let isFrameFile = components.count == 3
+                && components[0] == "frames"
+                && components[1].count == 6
+                && components[1].allSatisfy { $0.isNumber }
+                && ["rgb.jpg", "depth.f32", "confidence.u8", "frame.json"].contains(components[2])
+            guard isSessionMetadata || isFrameFile else {
+                throw TransferError(stage: .manifest, message: "Unexpected file in completed session", filePath: relative)
+            }
             let data: Data
             do {
                 data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])

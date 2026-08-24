@@ -65,7 +65,15 @@ def validate_manifest(payload: object) -> tuple[str, dict[str, dict[str, int | s
     for item in files:
         if not isinstance(item, dict):
             raise TransferError("manifest file entry must be an object")
-        relative = safe_relative_path(item.get("path"))
+        raw_path = item.get("path")
+        try:
+            relative = safe_relative_path(raw_path)
+        except TransferError as exc:
+            if isinstance(raw_path, str):
+                error = TransferError(str(exc))
+                error.path = raw_path  # type: ignore[attr-defined]
+                raise error from exc
+            raise
         size = item.get("size")
         digest = item.get("sha256")
         if relative in entries or not isinstance(size, int) or size < 0:
@@ -251,7 +259,11 @@ class Handler(BaseHTTPRequestHandler):
         except PermissionError:
             return
         except TransferError as exc:
-            self._send(HTTPStatus.BAD_REQUEST, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
+            payload = {"protocol_version": PROTOCOL_VERSION, "error": str(exc)}
+            path = getattr(exc, "path", None)
+            if path is not None:
+                payload["path"] = path
+            self._send(HTTPStatus.BAD_REQUEST, payload)
         except Exception as exc:
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
 

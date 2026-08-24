@@ -105,6 +105,14 @@ class ReceiverTests(unittest.TestCase):
         status, response = self.request("POST", "/v1/sessions/begin", bad)
         self.assertEqual(status, 400)
 
+    def test_begin_reports_rejected_manifest_path_without_normalizing_it(self):
+        manifest, _ = self.manifest()
+        manifest["files"][0] = {**manifest["files"][0], "path": "/frames/000000/rgb.jpg"}
+        status, response = self.request("POST", "/v1/sessions/begin", manifest)
+        self.assertEqual(status, 400)
+        self.assertEqual(response["path"], "/frames/000000/rgb.jpg")
+        self.assertIn("normalized forward-slash", response["error"])
+
     def test_resume_after_receiver_restart_returns_only_missing_files(self):
         manifest, files = self.manifest()
         self.request("POST", "/v1/sessions/begin", manifest)

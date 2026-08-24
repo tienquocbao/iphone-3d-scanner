@@ -66,7 +66,7 @@ struct ContentView: View {
                             .buttonStyle(.bordered)
                             .disabled(manager.isTransferring)
                         }
-                        Text("Trusted LAN only. The local session is deleted only after VERIFIED ACK.")
+                        Text("LAN or HTTPS receiver. Local session is deleted only after VERIFIED ACK.")
                             .font(.caption2)
                             .multilineTextAlignment(.center)
                     } else {
