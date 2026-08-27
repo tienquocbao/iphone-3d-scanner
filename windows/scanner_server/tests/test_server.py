@@ -17,7 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from server import LiveSession, PROTOCOL_VERSION, Handler, Receiver, ThreadingHTTPServer, json_bytes
+from server import LiveSession, PROTOCOL_VERSION, Handler, Receiver, ThreadingHTTPServer, canonical_manifest_bytes, json_bytes, manifest_sha256
 
 
 class ReceiverTests(unittest.TestCase):
@@ -63,6 +63,7 @@ class ReceiverTests(unittest.TestCase):
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual(status, 200)
         self.assertEqual(response["status"], "ready")
+        self.assertEqual(response["manifest_sha256"], manifest_sha256(1, "abc", {item["path"]: {"size": item["size"], "sha256": item["sha256"]} for item in manifest["files"]}))
         for path, data in files.items():
             status, response = self.request("PUT", "/v1/sessions/abc/files/" + path, data, "application/octet-stream")
             self.assertEqual(status, 200)
@@ -74,6 +75,33 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
         self.assertNotIn("file_count", response)
         self.assertNotIn("total_bytes", response)
+
+    def test_manifest_hash_fixture_is_fixed_and_not_legacy_json_hash(self):
+        fixture = json.loads((Path(__file__).parents[3] / "shared" / "schema" / "manifest_hash_fixture.json").read_text(encoding="utf-8"))
+        entries = {item["path"]: {"size": item["size"], "sha256": item["sha256"]} for item in fixture["files"]}
+        self.assertEqual(manifest_sha256(fixture["protocol_version"], fixture["session_id"], entries), fixture["expected_canonical_sha256"])
+        legacy = json.dumps({"protocol_version": 1, "session_id": "abc", "files": [{"path": path, **entries[path]} for path in sorted(entries)]}, separators=(",", ":")).encode()
+        self.assertNotEqual(hashlib.sha256(legacy).hexdigest(), fixture["expected_canonical_sha256"])
+
+    def test_legacy_verified_receipt_is_migrated_without_reupload(self):
+        manifest, files = self.manifest()
+        self.request("POST", "/v1/sessions/begin", manifest)
+        for path, data in files.items():
+            self.request("PUT", "/v1/sessions/abc/files/" + path, data, "application/octet-stream")
+        status, verified = self.request("POST", "/v1/sessions/abc/finalize", manifest)
+        self.assertEqual(status, 200)
+        receipt_path = self.storage / "session_abc" / ".verified.json"
+        legacy = dict(verified)
+        legacy["manifest_sha256"] = "f" * 64
+        legacy["file_count"] = legacy.pop("verified_file_count")
+        legacy["total_bytes"] = legacy.pop("verified_total_bytes")
+        receipt_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        status, retry = self.request("POST", "/v1/sessions/begin", manifest)
+        self.assertEqual((status, retry["status"]), (200, "verified"))
+        self.assertEqual(retry["manifest_sha256"], manifest_sha256(1, "abc", {item["path"]: {"size": item["size"], "sha256": item["sha256"]} for item in manifest["files"]}))
+        self.assertNotIn("file_count", retry)
+        self.assertNotIn("total_bytes", retry)
         self.assertTrue((self.storage / "session_abc" / ".verified.json").is_file())
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual((status, response["status"]), (200, "verified"))

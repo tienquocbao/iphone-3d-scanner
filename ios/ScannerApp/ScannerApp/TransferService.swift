@@ -113,7 +113,7 @@ enum KeychainStore {
     }
 }
 
-private struct TransferFile: Codable {
+struct TransferFile: Codable {
     let path: String
     let size: Int64
     let sha256: String
@@ -153,7 +153,7 @@ enum TransferPath {
     }
 }
 
-private struct TransferManifest: Codable {
+struct TransferManifest: Codable {
     let protocolVersion: Int
     let sessionID: String
     let files: [TransferFile]
@@ -163,6 +163,20 @@ private struct TransferManifest: Codable {
         case sessionID = "session_id"
         case files
     }
+}
+
+func canonicalManifestBytes(_ manifest: TransferManifest) -> Data {
+    var lines = [String(manifest.protocolVersion), manifest.sessionID]
+    for file in manifest.files.sorted(by: { $0.path < $1.path }) {
+        lines.append(file.path)
+        lines.append(String(file.size))
+        lines.append(file.sha256)
+    }
+    return Data((lines.joined(separator: "\n") + "\n").utf8)
+}
+
+func manifestSHA256(_ manifest: TransferManifest) -> String {
+    SHA256.hash(data: canonicalManifestBytes(manifest)).map { String(format: "%02x", $0) }.joined()
 }
 
 private struct BeginResponse: Codable {
@@ -260,8 +274,9 @@ final class SessionTransferService {
         guard begin.protocolVersion == Self.protocolVersion, begin.sessionID == sessionID else {
             throw TransferError(stage: .begin, message: "Protocol or session ID mismatch in BEGIN response")
         }
+        let localManifestHash = manifestSHA256(manifest)
         if begin.status == "verified" {
-            guard begin.manifestSHA256 == manifestHash(manifest),
+            guard begin.manifestSHA256 == localManifestHash,
                   begin.verifiedFileCount == manifest.files.count,
                   begin.verifiedTotalBytes == manifestTotalBytes(manifest)
             else { throw TransferError(stage: .ackValidation, message: "Verified BEGIN response does not match manifest") }
@@ -269,6 +284,9 @@ final class SessionTransferService {
             return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
         }
         guard begin.status == "ready" else { throw TransferError(stage: .begin, message: "Unexpected BEGIN status: \(begin.status)") }
+        guard begin.manifestSHA256 == localManifestHash else {
+            throw TransferError(stage: .begin, message: "Receiver manifest hash differs from local canonical manifest")
+        }
 
         let filesByPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
         var missingFiles: [TransferFile] = []
@@ -309,7 +327,7 @@ final class SessionTransferService {
         guard Self.isValidVerifiedAcknowledgement(
             verified,
             sessionID: sessionID,
-            manifestHash: manifestHash(manifest),
+            manifestHash: localManifestHash,
             fileCount: manifest.files.count,
             totalBytes: manifestTotalBytes(manifest)
         )
@@ -440,11 +458,6 @@ final class SessionTransferService {
 
     private func boundedBody(_ data: Data) -> String {
         String(data: data.prefix(8192), encoding: .utf8) ?? "<non-UTF8 response>"
-    }
-
-    private func manifestHash(_ manifest: TransferManifest) -> String {
-        let data = (try? JSONEncoder().encode(manifest)) ?? Data()
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private func manifestTotalBytes(_ manifest: TransferManifest) -> Int64 {

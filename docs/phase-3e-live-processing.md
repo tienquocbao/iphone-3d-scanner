@@ -20,6 +20,29 @@ At STOP, the app waits for queued live uploads, writes the authoritative final
 remains the source of truth. Live upload never authorizes local deletion; the
 completed session remains local until strict final ACK validation succeeds.
 
+## Manifest identity
+
+Protocol version 1 uses explicit canonical UTF-8 bytes for `manifest_sha256`,
+not serialized JSON. The bytes contain a trailing newline and one value per
+line in this order:
+
+```text
+protocol_version
+session_id
+path
+size
+sha256
+path
+size
+sha256
+...
+```
+
+File triples are sorted lexically by canonical relative path. Paths and
+SHA-256 values are restricted to the validated ASCII forms, and sizes are
+decimal integers. Swift and Python must hash these exact bytes. The server
+returns this hash in both `ready` and `verified` responses.
+
 The receiver endpoints are:
 
 ```text

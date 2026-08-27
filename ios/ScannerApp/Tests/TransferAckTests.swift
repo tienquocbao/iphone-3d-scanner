@@ -1,6 +1,21 @@
 import XCTest
 
 final class TransferAckTests: XCTestCase {
+    func testCanonicalManifestHashMatchesSharedFixture() {
+        let manifest = TransferManifest(
+            protocolVersion: 1,
+            sessionID: "abc",
+            files: [
+                TransferFile(path: "session.json", size: 123, sha256: String(repeating: "0", count: 64)),
+                TransferFile(path: "frames/000000/rgb.jpg", size: 456, sha256: String(repeating: "1", count: 64)),
+                TransferFile(path: "frames/000000/depth.f32", size: 789, sha256: String(repeating: "2", count: 64)),
+                TransferFile(path: "frames/000000/confidence.u8", size: 12, sha256: String(repeating: "3", count: 64)),
+                TransferFile(path: "frames/000000/frame.json", size: 345, sha256: String(repeating: "4", count: 64))
+            ]
+        )
+        XCTAssertEqual(manifestSHA256(manifest), "2ce25b90aa5a5b787a3dd14d3c1209a6db4f6a6250eeba167459f8bceb0ee50d")
+    }
+
     private let json = """
     {
       "protocol_version": 1,

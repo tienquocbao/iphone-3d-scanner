@@ -35,6 +35,30 @@ def json_bytes(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
 
 
+def canonical_manifest_bytes(
+    protocol_version: int,
+    session_id: str,
+    entries: dict[str, dict[str, int | str]],
+) -> bytes:
+    """Return the protocol-v1 manifest identity bytes.
+
+    The format is one UTF-8 line per value, terminated by a final newline:
+    protocol version, session id, then each path/size/sha256 triple in
+    lexical path order. Manifest values are already restricted to ASCII by
+    validation, so this representation is unambiguous and independent of
+    JSON serialization details.
+    """
+    lines = [str(protocol_version), session_id]
+    for path in sorted(entries):
+        entry = entries[path]
+        lines.extend([path, str(entry["size"]), str(entry["sha256"])])
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def manifest_sha256(protocol_version: int, session_id: str, entries: dict[str, dict[str, int | str]]) -> str:
+    return hashlib.sha256(canonical_manifest_bytes(protocol_version, session_id, entries)).hexdigest()
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -252,7 +276,7 @@ def validate_manifest(payload: object) -> tuple[str, dict[str, dict[str, int | s
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise TransferError(f"invalid sha256 for {relative}")
         entries[relative] = {"size": size, "sha256": digest}
-    manifest_hash = hashlib.sha256(json_bytes({"protocol_version": PROTOCOL_VERSION, "session_id": session_id, "files": [{"path": p, **entries[p]} for p in sorted(entries)]})).hexdigest()
+    manifest_hash = manifest_sha256(PROTOCOL_VERSION, session_id, entries)
     return session_id, entries, manifest_hash
 
 
@@ -300,7 +324,19 @@ class Receiver:
         print(f"BEGIN files={len(entries)} bytes={sum(int(entry['size']) for entry in entries.values())}", flush=True)
         final = self.completed(session_id)
         if final.is_dir() and (final / ".verified.json").is_file():
-            verified = load_verified_receipt(final / ".verified.json", session_id, manifest_hash)
+            try:
+                verified = load_verified_receipt(final / ".verified.json", session_id, manifest_hash)
+            except TransferError:
+                receipt = json.loads((final / ".verified.json").read_text(encoding="utf-8"))
+                legacy = isinstance(receipt, dict) and "file_count" in receipt and "total_bytes" in receipt
+                if not legacy or not self._completed_matches_manifest(final, session_id, entries, receipt):
+                    raise
+                verified = canonical_verified_ack(
+                    session_id,
+                    manifest_hash,
+                    len(entries),
+                    sum(int(entry["size"]) for entry in entries.values()),
+                )
             (final / ".verified.json").write_text(json.dumps(verified, indent=2), encoding="utf-8")
             return {**verified, "missing": []}
         staging = self.staging(session_id)
@@ -308,7 +344,7 @@ class Receiver:
         manifest = {"protocol_version": PROTOCOL_VERSION, "session_id": session_id, "files": [{"path": path, **entries[path]} for path in sorted(entries)], "manifest_sha256": manifest_hash}
         (staging / ".manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         missing = [path for path, entry in entries.items() if not self._matches(staging / path, entry)]
-        return {"protocol_version": PROTOCOL_VERSION, "status": "ready", "session_id": session_id, "missing": sorted(missing)}
+        return {"protocol_version": PROTOCOL_VERSION, "status": "ready", "session_id": session_id, "manifest_sha256": manifest_hash, "missing": sorted(missing)}
 
     def put_file(self, session_id: str, relative: str, content_length: int, body) -> dict[str, object]:
         session_id = safe_session_id(session_id)
@@ -419,6 +455,36 @@ class Receiver:
     @staticmethod
     def _matches(path: Path, entry: dict[str, int | str]) -> bool:
         return path.is_file() and path.stat().st_size == entry["size"] and file_sha256(path) == entry["sha256"]
+
+    def _completed_matches_manifest(
+        self,
+        final: Path,
+        session_id: str,
+        entries: dict[str, dict[str, int | str]],
+        receipt: object,
+    ) -> bool:
+        if not isinstance(receipt, dict) or receipt.get("protocol_version") != PROTOCOL_VERSION or receipt.get("status") != "verified" or receipt.get("session_id") != session_id:
+            return False
+        if type(receipt.get("file_count")) is not int or type(receipt.get("total_bytes")) is not int:
+            return False
+        if receipt["file_count"] != len(entries) or receipt["total_bytes"] != sum(int(entry["size"]) for entry in entries.values()):
+            return False
+        if any(not self._matches(final / relative, entry) for relative, entry in entries.items()):
+            return False
+        try:
+            session = json.loads((final / "session.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if session.get("status") != "completed" or session.get("session_id") != session_id:
+            return False
+        frame_paths = sorted(path for path in entries if path.startswith("frames/") and path.endswith("/frame.json"))
+        frame_count = session.get("frame_count")
+        if not isinstance(frame_count, int) or frame_count != len(frame_paths):
+            return False
+        return all(
+            {f"frames/{index:06d}/{name}" for name in ("rgb.jpg", "depth.f32", "confidence.u8", "frame.json")}.issubset(entries)
+            for index in range(frame_count)
+        )
 
 
 class Handler(BaseHTTPRequestHandler):
