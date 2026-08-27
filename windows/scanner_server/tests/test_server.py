@@ -63,18 +63,13 @@ class ReceiverTests(unittest.TestCase):
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual(status, 200)
         self.assertEqual(response["status"], "ready")
-        self.assertEqual(response["manifest_sha256"], manifest_sha256(1, "abc", {item["path"]: {"size": item["size"], "sha256": item["sha256"]} for item in manifest["files"]}))
         for path, data in files.items():
             status, response = self.request("PUT", "/v1/sessions/abc/files/" + path, data, "application/octet-stream")
             self.assertEqual(status, 200)
             self.assertEqual(response["status"], "stored")
         status, response = self.request("POST", "/v1/sessions/abc/finalize", manifest)
         self.assertEqual(status, 200)
-        self.assertEqual(response["status"], "verified")
-        self.assertEqual(response["verified_file_count"], 5)
-        self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
-        self.assertNotIn("file_count", response)
-        self.assertNotIn("total_bytes", response)
+        self.assertEqual(response, {"protocol_version": 1, "status": "verified", "session_id": "abc"})
 
     def test_manifest_hash_fixture_is_fixed_and_not_legacy_json_hash(self):
         fixture = json.loads((Path(__file__).parents[3] / "shared" / "schema" / "manifest_hash_fixture.json").read_text(encoding="utf-8"))
@@ -91,7 +86,7 @@ class ReceiverTests(unittest.TestCase):
         status, verified = self.request("POST", "/v1/sessions/abc/finalize", manifest)
         self.assertEqual(status, 200)
         receipt_path = self.storage / "session_abc" / ".verified.json"
-        legacy = dict(verified)
+        legacy = json.loads((self.storage / "session_abc" / ".verified.json").read_text(encoding="utf-8"))
         legacy["manifest_sha256"] = "f" * 64
         legacy["file_count"] = legacy.pop("verified_file_count")
         legacy["total_bytes"] = legacy.pop("verified_total_bytes")
@@ -99,16 +94,11 @@ class ReceiverTests(unittest.TestCase):
 
         status, retry = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual((status, retry["status"]), (200, "verified"))
-        self.assertEqual(retry["manifest_sha256"], manifest_sha256(1, "abc", {item["path"]: {"size": item["size"], "sha256": item["sha256"]} for item in manifest["files"]}))
-        self.assertNotIn("file_count", retry)
-        self.assertNotIn("total_bytes", retry)
+        self.assertEqual(retry, {"protocol_version": 1, "status": "verified", "session_id": "abc", "missing": []})
         self.assertTrue((self.storage / "session_abc" / ".verified.json").is_file())
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual((status, response["status"]), (200, "verified"))
-        self.assertEqual(response["verified_file_count"], 5)
-        self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
-        self.assertNotIn("file_count", response)
-        self.assertNotIn("total_bytes", response)
+        self.assertEqual(response, {"protocol_version": 1, "status": "verified", "session_id": "abc", "missing": []})
 
     def test_health_requires_correct_bearer_token(self):
         status, _ = self.request("GET", "/api/v1/health", b"", token=None)
@@ -187,10 +177,7 @@ class ReceiverTests(unittest.TestCase):
 
         status, response = self.request("POST", "/v1/sessions/begin", manifest)
         self.assertEqual((status, response["status"]), (200, "verified"))
-        self.assertEqual(response["verified_file_count"], first["verified_file_count"])
-        self.assertEqual(response["verified_total_bytes"], first["verified_total_bytes"])
-        self.assertNotIn("file_count", response)
-        self.assertNotIn("total_bytes", response)
+        self.assertEqual(response, {"protocol_version": 1, "status": "verified", "session_id": "abc", "missing": []})
         normalized = json.loads(receipt_path.read_text(encoding="utf-8"))
         self.assertIn("verified_file_count", normalized)
         self.assertIn("verified_total_bytes", normalized)
@@ -216,8 +203,7 @@ class ReceiverTests(unittest.TestCase):
             status, _ = self.request("PUT", "/v1/sessions/large-test/files/" + path, data, "application/octet-stream")
             self.assertEqual(status, 200)
         status, response = self.request("POST", "/v1/sessions/large-test/finalize", manifest)
-        self.assertEqual((status, response["status"], response["verified_file_count"]), (200, "verified", 517))
-        self.assertEqual(response["verified_total_bytes"], sum(len(data) for data in files.values()))
+        self.assertEqual(response, {"protocol_version": 1, "status": "verified", "session_id": "large-test"})
 
     def test_live_routes_require_auth_and_stage_concurrent_frame_files(self):
         status, _ = self.request("POST", "/api/v1/live/sessions/live-test/start", {}, token="wrong")

@@ -20,28 +20,18 @@ At STOP, the app waits for queued live uploads, writes the authoritative final
 remains the source of truth. Live upload never authorizes local deletion; the
 completed session remains local until strict final ACK validation succeeds.
 
-## Manifest identity
+## Final deletion authority
 
-Protocol version 1 uses explicit canonical UTF-8 bytes for `manifest_sha256`,
-not serialized JSON. The bytes contain a trailing newline and one value per
-line in this order:
+The receiver remains the authoritative verifier. It validates every file,
+size, SHA-256, path, completed `session.json`, frame count, and required frame
+files before returning a network ACK with only `protocol_version`, `status`,
+and `session_id`. The iPhone deletes its exact local session only when those
+three values are valid and the session ID matches. Missing, malformed, or
+non-verified responses always preserve the local copy.
 
-```text
-protocol_version
-session_id
-path
-size
-sha256
-path
-size
-sha256
-...
-```
-
-File triples are sorted lexically by canonical relative path. Paths and
-SHA-256 values are restricted to the validated ASCII forms, and sizes are
-decimal integers. Swift and Python must hash these exact bytes. The server
-returns this hash in both `ready` and `verified` responses.
+The receiver may retain manifest hashes, counts, byte totals, and verification
+timestamps in `.verified.json` as internal diagnostics. They are not part of
+the iPhone deletion contract.
 
 The receiver endpoints are:
 

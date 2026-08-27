@@ -113,7 +113,7 @@ enum KeychainStore {
     }
 }
 
-struct TransferFile: Codable {
+private struct TransferFile: Codable {
     let path: String
     let size: Int64
     let sha256: String
@@ -153,7 +153,7 @@ enum TransferPath {
     }
 }
 
-struct TransferManifest: Codable {
+private struct TransferManifest: Codable {
     let protocolVersion: Int
     let sessionID: String
     let files: [TransferFile]
@@ -165,55 +165,29 @@ struct TransferManifest: Codable {
     }
 }
 
-func canonicalManifestBytes(_ manifest: TransferManifest) -> Data {
-    var lines = [String(manifest.protocolVersion), manifest.sessionID]
-    for file in manifest.files.sorted(by: { $0.path < $1.path }) {
-        lines.append(file.path)
-        lines.append(String(file.size))
-        lines.append(file.sha256)
-    }
-    return Data((lines.joined(separator: "\n") + "\n").utf8)
-}
-
-func manifestSHA256(_ manifest: TransferManifest) -> String {
-    SHA256.hash(data: canonicalManifestBytes(manifest)).map { String(format: "%02x", $0) }.joined()
-}
-
 private struct BeginResponse: Codable {
     let protocolVersion: Int
     let status: String
     let sessionID: String
     let missing: [String]?
-    let manifestSHA256: String?
-    let verifiedFileCount: Int?
-    let verifiedTotalBytes: Int64?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case status
         case sessionID = "session_id"
         case missing
-        case manifestSHA256 = "manifest_sha256"
-        case verifiedFileCount = "verified_file_count"
-        case verifiedTotalBytes = "verified_total_bytes"
     }
 }
 
-struct VerifiedResponse: Codable {
+struct FinalizeAck: Codable {
     let protocolVersion: Int
     let status: String
     let sessionID: String
-    let verifiedFileCount: Int
-    let manifestSHA256: String
-    let verifiedTotalBytes: Int64
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case status
         case sessionID = "session_id"
-        case verifiedFileCount = "verified_file_count"
-        case manifestSHA256 = "manifest_sha256"
-        case verifiedTotalBytes = "verified_total_bytes"
     }
 }
 
@@ -274,19 +248,13 @@ final class SessionTransferService {
         guard begin.protocolVersion == Self.protocolVersion, begin.sessionID == sessionID else {
             throw TransferError(stage: .begin, message: "Protocol or session ID mismatch in BEGIN response")
         }
-        let localManifestHash = manifestSHA256(manifest)
         if begin.status == "verified" {
-            guard begin.manifestSHA256 == localManifestHash,
-                  begin.verifiedFileCount == manifest.files.count,
-                  begin.verifiedTotalBytes == manifestTotalBytes(manifest)
-            else { throw TransferError(stage: .ackValidation, message: "Verified BEGIN response does not match manifest") }
+            guard Self.canDeleteLocalSession(localSessionID: sessionID, ack: FinalizeAck(protocolVersion: begin.protocolVersion, status: begin.status, sessionID: begin.sessionID))
+            else { throw TransferError(stage: .ackValidation, message: "Invalid VERIFIED BEGIN acknowledgement") }
             try captureService.deleteSession(sessionID: sessionID)
             return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
         }
         guard begin.status == "ready" else { throw TransferError(stage: .begin, message: "Unexpected BEGIN status: \(begin.status)") }
-        guard begin.manifestSHA256 == localManifestHash else {
-            throw TransferError(stage: .begin, message: "Receiver manifest hash differs from local canonical manifest")
-        }
 
         let filesByPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
         var missingFiles: [TransferFile] = []
@@ -322,19 +290,13 @@ final class SessionTransferService {
             body: try encodeFinalizeManifest(manifest, encoder: encoder),
             token: authToken,
             stage: .finalize,
-            decode: VerifiedResponse.self
+            decode: FinalizeAck.self
         )
-        guard Self.isValidVerifiedAcknowledgement(
-            verified,
-            sessionID: sessionID,
-            manifestHash: localManifestHash,
-            fileCount: manifest.files.count,
-            totalBytes: manifestTotalBytes(manifest)
-        )
+        guard Self.canDeleteLocalSession(localSessionID: sessionID, ack: verified)
         else { throw TransferError(stage: .ackValidation, message: "Missing or invalid VERIFIED acknowledgement") }
 
         try captureService.deleteSession(sessionID: sessionID)
-        return TransferResult(sessionID: sessionID, fileCount: verified.verifiedFileCount)
+        return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
     }
 
     func testConnection(serverURLString: String, authToken: String) async throws {
@@ -460,23 +422,10 @@ final class SessionTransferService {
         String(data: data.prefix(8192), encoding: .utf8) ?? "<non-UTF8 response>"
     }
 
-    private func manifestTotalBytes(_ manifest: TransferManifest) -> Int64 {
-        manifest.files.reduce(Int64(0)) { total, file in total + file.size }
-    }
-
-    static func isValidVerifiedAcknowledgement(
-        _ response: VerifiedResponse,
-        sessionID: String,
-        manifestHash: String,
-        fileCount: Int,
-        totalBytes: Int64
-    ) -> Bool {
-        response.protocolVersion == protocolVersion
-            && response.status == "verified"
-            && response.sessionID == sessionID
-            && response.manifestSHA256 == manifestHash
-            && response.verifiedFileCount == fileCount
-            && response.verifiedTotalBytes == totalBytes
+    static func canDeleteLocalSession(localSessionID: String, ack: FinalizeAck) -> Bool {
+        ack.protocolVersion == protocolVersion
+            && ack.status == "verified"
+            && ack.sessionID == localSessionID
     }
 
     private func encodeFinalizeManifest(_ manifest: TransferManifest, encoder: JSONEncoder) throws -> Data {

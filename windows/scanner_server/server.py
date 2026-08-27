@@ -73,7 +73,15 @@ def safe_session_id(value: object) -> str:
     return value
 
 
-def canonical_verified_ack(
+def verified_network_ack(session_id: str) -> dict[str, object]:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "status": "verified",
+        "session_id": session_id,
+    }
+
+
+def canonical_verified_receipt(
     session_id: str,
     manifest_hash: str,
     file_count: int,
@@ -107,7 +115,7 @@ def load_verified_receipt(path: Path, session_id: str, manifest_hash: str) -> di
     total_bytes = receipt.get("verified_total_bytes", receipt.get("total_bytes"))
     if type(file_count) is not int or file_count < 0 or type(total_bytes) is not int or total_bytes < 0:
         raise TransferError("verified receipt has invalid totals")
-    return canonical_verified_ack(session_id, manifest_hash, file_count, total_bytes)
+    return canonical_verified_receipt(session_id, manifest_hash, file_count, total_bytes)
 
 
 class LiveSession:
@@ -331,20 +339,20 @@ class Receiver:
                 legacy = isinstance(receipt, dict) and "file_count" in receipt and "total_bytes" in receipt
                 if not legacy or not self._completed_matches_manifest(final, session_id, entries, receipt):
                     raise
-                verified = canonical_verified_ack(
+                verified = canonical_verified_receipt(
                     session_id,
                     manifest_hash,
                     len(entries),
                     sum(int(entry["size"]) for entry in entries.values()),
                 )
             (final / ".verified.json").write_text(json.dumps(verified, indent=2), encoding="utf-8")
-            return {**verified, "missing": []}
+            return {**verified_network_ack(session_id), "missing": []}
         staging = self.staging(session_id)
         staging.mkdir(parents=True, exist_ok=True)
         manifest = {"protocol_version": PROTOCOL_VERSION, "session_id": session_id, "files": [{"path": path, **entries[path]} for path in sorted(entries)], "manifest_sha256": manifest_hash}
         (staging / ".manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         missing = [path for path, entry in entries.items() if not self._matches(staging / path, entry)]
-        return {"protocol_version": PROTOCOL_VERSION, "status": "ready", "session_id": session_id, "manifest_sha256": manifest_hash, "missing": sorted(missing)}
+        return {"protocol_version": PROTOCOL_VERSION, "status": "ready", "session_id": session_id, "missing": sorted(missing)}
 
     def put_file(self, session_id: str, relative: str, content_length: int, body) -> dict[str, object]:
         session_id = safe_session_id(session_id)
@@ -435,7 +443,7 @@ class Receiver:
             required = {prefix + name for name in ("rgb.jpg", "depth.f32", "confidence.u8", "frame.json")}
             if not required.issubset(entries):
                 raise TransferError(f"manifest is missing required files for frame {index:06d}")
-        verified = canonical_verified_ack(
+        verified = canonical_verified_receipt(
             session_id,
             manifest_hash,
             len(entries),
@@ -450,7 +458,7 @@ class Receiver:
         os.replace(staging, final)
         self.stop_live(session_id)
         print("FINALIZE validation=PASS", flush=True)
-        return verified
+        return verified_network_ack(session_id)
 
     @staticmethod
     def _matches(path: Path, entry: dict[str, int | str]) -> bool:
