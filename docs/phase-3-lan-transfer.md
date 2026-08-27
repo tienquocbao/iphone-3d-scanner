@@ -27,8 +27,10 @@ passes. Completed sessions are moved atomically to `session_<id>`.
    then atomically replaces the staged destination.
 4. iPhone sends `POST /v1/sessions/<id>/finalize` with the manifest.
 5. Receiver verifies every file, completed session metadata, frame count, and
-   required four-file frame layout, then returns `status: verified`.
-6. Only after that response does the iPhone delete its local raw session.
+   required four-file frame layout, then returns a VERIFIED ACK containing
+   only `protocol_version`, `status`, and `session_id`.
+6. The iPhone checks those three fields and only then deletes its local raw
+   session. The receiver may retain detailed verification metadata internally.
 
 Any timeout, HTTP error, checksum mismatch, incomplete manifest, or app restart
 leaves the iPhone session untouched. Repeating `begin` resumes missing files;
@@ -45,4 +47,3 @@ http://192.168.1.50:8765
 The value is stored in device-local `UserDefaults`; no machine-specific URL is
 committed. The app requests local-network permission and enables only the
 `NSAllowsLocalNetworking` ATS exception needed for trusted-LAN HTTP.
-

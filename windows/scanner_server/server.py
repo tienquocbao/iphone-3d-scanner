@@ -31,6 +31,10 @@ class TransferError(ValueError):
     pass
 
 
+class QuiesceError(TransferError):
+    pass
+
+
 def json_bytes(value: object) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
 
@@ -127,6 +131,8 @@ class LiveSession:
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.stop_requested = False
+        self.accepting_uploads = True
+        self.active_uploads = 0
         self.uploaded_files = 0
         self.uploaded_bytes = 0
         self.ready_frames = 0
@@ -157,6 +163,8 @@ class LiveSession:
                 "protocol_version": PROTOCOL_VERSION,
                 "session_id": self.session_id,
                 "state": "recording" if not self.stop_requested else "stopped",
+                "accepting_uploads": self.accepting_uploads,
+                "active_uploads": self.active_uploads,
                 "uploaded_files": self.uploaded_files,
                 "uploaded_bytes": self.uploaded_bytes,
                 "ready_frames": self.ready_frames,
@@ -174,7 +182,35 @@ class LiveSession:
     def stop(self) -> None:
         with self.condition:
             self.stop_requested = True
+            self.accepting_uploads = False
             self.condition.notify_all()
+
+    def begin_upload(self) -> None:
+        with self.condition:
+            if not self.accepting_uploads:
+                raise QuiesceError("live session is quiescing")
+            self.active_uploads += 1
+
+    def end_upload(self) -> None:
+        with self.condition:
+            self.active_uploads -= 1
+            self.condition.notify_all()
+
+    def quiesce(self, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            self.accepting_uploads = False
+            self.stop_requested = True
+            self.condition.notify_all()
+            while self.active_uploads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise QuiesceError("live session could not quiesce: active uploads did not finish")
+                self.condition.wait(timeout=remaining)
+        remaining = max(0.0, deadline - time.monotonic())
+        self.worker.join(timeout=remaining)
+        if self.worker.is_alive():
+            raise QuiesceError("live session could not quiesce: processor did not stop")
 
     def _ready_indexes(self) -> list[int]:
         frames = self.staging / "frames"
@@ -195,6 +231,8 @@ class LiveSession:
                 self.condition.wait_for(lambda: self.stop_requested or self._ready_indexes())
                 indexes = self._ready_indexes()
                 next_index = self.processed_frames
+                if self.stop_requested:
+                    return
                 if next_index not in indexes:
                     if self.stop_requested:
                         return
@@ -294,6 +332,8 @@ class Receiver:
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self.live_sessions: dict[str, LiveSession] = {}
         self.live_lock = threading.Lock()
+        self.finalization_locks: dict[str, threading.Lock] = {}
+        self.finalization_lock = threading.Lock()
 
     def staging(self, session_id: str) -> Path:
         return self.storage_root / f".session_{session_id}.staging"
@@ -326,6 +366,14 @@ class Receiver:
             live = self.live_sessions.pop(session_id, None)
         if live is not None:
             live.stop()
+
+    def _finalization_lock_for(self, session_id: str) -> threading.Lock:
+        with self.finalization_lock:
+            return self.finalization_locks.setdefault(session_id, threading.Lock())
+
+    def _remove_live(self, session_id: str) -> None:
+        with self.live_lock:
+            self.live_sessions.pop(session_id, None)
 
     def begin(self, payload: object) -> dict[str, object]:
         session_id, entries, manifest_hash = validate_manifest(payload)
@@ -398,29 +446,45 @@ class Receiver:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
             raise TransferError("invalid live sha256")
         live = self.live_session(session_id)
-        destination = live.staging / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".live-upload-", delete=False) as handle:
-            temporary = Path(handle.name)
-            digest = hashlib.sha256()
-            remaining = content_length
-            while remaining:
-                chunk = body.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    temporary.unlink(missing_ok=True)
-                    raise TransferError("request body ended before Content-Length")
-                handle.write(chunk)
-                digest.update(chunk)
-                remaining -= len(chunk)
-        if digest.hexdigest() != expected_sha256:
-            temporary.unlink(missing_ok=True)
-            raise TransferError("sha256 mismatch")
-        os.replace(temporary, destination)
-        live.record_upload(content_length)
-        return {"protocol_version": PROTOCOL_VERSION, "status": "stored", "session_id": session_id, "path": relative, "sha256": expected_sha256}
+        live.begin_upload()
+        try:
+            destination = live.staging / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".live-upload-", delete=False) as handle:
+                temporary = Path(handle.name)
+                digest = hashlib.sha256()
+                remaining = content_length
+                while remaining:
+                    chunk = body.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        temporary.unlink(missing_ok=True)
+                        raise TransferError("request body ended before Content-Length")
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+            if digest.hexdigest() != expected_sha256:
+                temporary.unlink(missing_ok=True)
+                raise TransferError("sha256 mismatch")
+            os.replace(temporary, destination)
+            live.record_upload(content_length)
+            return {"protocol_version": PROTOCOL_VERSION, "status": "stored", "session_id": session_id, "path": relative, "sha256": expected_sha256}
+        finally:
+            live.end_upload()
 
     def finalize(self, payload: object) -> dict[str, object]:
         session_id, entries, manifest_hash = validate_manifest(payload)
+        with self._finalization_lock_for(session_id):
+            return self._finalize_locked(session_id, entries, manifest_hash)
+
+    def _finalize_locked(self, session_id: str, entries: dict[str, dict[str, int | str]], manifest_hash: str) -> dict[str, object]:
+        final = self.completed(session_id)
+        if final.is_dir() and (final / ".verified.json").is_file():
+            load_verified_receipt(final / ".verified.json", session_id, manifest_hash)
+            return verified_network_ack(session_id)
+
+        live = self.live_session(session_id) if session_id in self.live_sessions else None
+        if live is not None:
+            live.quiesce()
         staging = self.staging(session_id)
         if not staging.is_dir():
             raise TransferError("transfer has not been begun")
@@ -456,7 +520,7 @@ class Receiver:
                 raise TransferError("completed session path is not a directory")
             shutil.rmtree(final)
         os.replace(staging, final)
-        self.stop_live(session_id)
+        self._remove_live(session_id)
         print("FINALIZE validation=PASS", flush=True)
         return verified_network_ack(session_id)
 
@@ -572,6 +636,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except PermissionError:
             return
+        except QuiesceError as exc:
+            self._send(HTTPStatus.CONFLICT, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
         except TransferError as exc:
             payload = {"protocol_version": PROTOCOL_VERSION, "error": str(exc)}
             path = getattr(exc, "path", None)
@@ -612,6 +678,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, response)
         except PermissionError:
             return
+        except QuiesceError as exc:
+            self._send(HTTPStatus.CONFLICT, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
         except (TransferError, ValueError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"protocol_version": PROTOCOL_VERSION, "error": str(exc)})
         except Exception as exc:

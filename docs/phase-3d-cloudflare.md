@@ -34,11 +34,12 @@ GET /api/v1/health
 Authorization: Bearer <local secret>
 ```
 
-Only a protocol-version-1 `status: verified` finalize response can cause the
-iPhone to delete its local raw session. Authentication failures, timeouts,
-checksum failures, and malformed responses preserve the local session.
+Only an authenticated protocol-version-1 VERIFIED ACK with the exact session
+ID can cause the iPhone to delete its local raw session. Authentication
+failures, timeouts, checksum failures, and malformed responses preserve the
+local session. The receiver keeps detailed verification metadata internally;
+the iPhone deletion contract does not depend on those fields.
 
 The tunnel configuration is intentionally kept outside the repository because
 it contains a machine-specific credentials-file path. Preserve unrelated
 ingress rules when deploying the tunnel.
-
