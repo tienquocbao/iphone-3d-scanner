@@ -2,489 +2,71 @@ import CryptoKit
 import Foundation
 import Security
 
-enum TransferStage: String {
-    case health = "HEALTH"
-    case manifest = "MANIFEST"
-    case begin = "BEGIN"
-    case upload = "PUT"
-    case finalize = "FINALIZE"
-    case ackValidation = "ACK VALIDATION"
-}
+enum TransferStage: String { case health = "HEALTH", plan = "PLAN", start = "START", batch = "BATCH", finalize = "FINALIZE", acknowledgement = "ACK" }
 
 struct TransferError: LocalizedError {
-    let stage: TransferStage
-    let message: String
-    let filePath: String?
-    let statusCode: Int?
-    let responseBody: String?
-    let underlyingDescription: String?
-    let underlyingCode: URLError.Code?
-
-    init(
-        stage: TransferStage,
-        message: String,
-        filePath: String? = nil,
-        statusCode: Int? = nil,
-        responseBody: String? = nil,
-        underlying: Error? = nil
-    ) {
-        self.stage = stage
-        self.message = message
-        self.filePath = filePath
-        self.statusCode = statusCode
-        self.responseBody = responseBody
-        self.underlyingDescription = underlying?.localizedDescription
-        self.underlyingCode = (underlying as? URLError)?.code
-    }
-
-    var errorDescription: String? {
-        var lines = ["Stage: \(stage.rawValue)"]
-        if let filePath { lines.append("File: \(filePath)") }
-        if let statusCode { lines.append("HTTP: \(statusCode)") }
-        lines.append(message)
-        if let responseBody, !responseBody.isEmpty { lines.append(responseBody) }
-        if let underlyingDescription { lines.append(underlyingDescription) }
-        return lines.joined(separator: "\n")
-    }
+    let stage: TransferStage; let message: String; let batchIndex: Int?; let statusCode: Int?; let responseBody: String?
+    init(stage: TransferStage, message: String, batchIndex: Int? = nil, statusCode: Int? = nil, responseBody: String? = nil) { self.stage = stage; self.message = message; self.batchIndex = batchIndex; self.statusCode = statusCode; self.responseBody = responseBody }
+    var errorDescription: String? { var lines=["Stage: \(stage.rawValue)"]; if let batchIndex { lines.append("Batch: \(batchIndex)") }; if let statusCode { lines.append("HTTP: \(statusCode)") }; lines.append(message); if let responseBody, !responseBody.isEmpty { lines.append(responseBody) }; return lines.joined(separator:"\n") }
 }
 
-extension TransferError {
-    static var invalidServerURL: TransferError { TransferError(stage: .health, message: "Invalid receiver URL") }
-    static var sessionNotFound: TransferError { TransferError(stage: .manifest, message: "Completed scan session was not found") }
-    static var invalidSession: TransferError { TransferError(stage: .manifest, message: "Session metadata is not completed") }
-    static var protocolMismatch: TransferError { TransferError(stage: .ackValidation, message: "Protocol or session ID mismatch") }
-    static var invalidAcknowledgement: TransferError { TransferError(stage: .ackValidation, message: "Invalid VERIFIED acknowledgement") }
-    static func serverRejected(_ message: String, stage: TransferStage = .health, filePath: String? = nil, statusCode: Int? = nil, responseBody: String? = nil, underlying: Error? = nil) -> TransferError {
-        TransferError(stage: stage, message: message, filePath: filePath, statusCode: statusCode, responseBody: responseBody, underlying: underlying)
-    }
-}
-
-struct TransferSettings {
-    static let userDefaultsKey = "scanner.windowsServerURL"
-
-    static var serverURL: String {
-        get { UserDefaults.standard.string(forKey: userDefaultsKey) ?? "" }
-        set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: userDefaultsKey) }
-    }
-}
-
-struct TransferPolicy {
-    let maxConcurrentUploads: Int
-
-    static let `default` = TransferPolicy(maxConcurrentUploads: 4)
-}
+struct TransferSettings { static let userDefaultsKey = "scanner.windowsServerURL"; static var serverURL: String { get { UserDefaults.standard.string(forKey: userDefaultsKey) ?? "" } set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: userDefaultsKey) } } }
 
 enum KeychainStore {
-    private static let service = "com.local.iphone3dscanner.transfer"
-    private static let account = "receiver-bearer-token"
-
-    static func load() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              let value = String(data: data, encoding: .utf8),
-              !value.isEmpty else { return nil }
-        return value
-    }
-
-    static func save(_ value: String) throws {
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        let attributes: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = query
-            item[kSecValueData as String] = data
-            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else {
-                throw TransferError.serverRejected("Could not save receiver token in Keychain")
-            }
-        } else if status != errSecSuccess {
-            throw TransferError.serverRejected("Could not update receiver token in Keychain")
-        }
-    }
+    private static let service = "com.local.iphone3dscanner.transfer"; private static let account = "receiver-bearer-token"
+    static func load() -> String? { let q: [String: Any] = [kSecClass as String:kSecClassGenericPassword, kSecAttrService as String:service, kSecAttrAccount as String:account, kSecReturnData as String:true, kSecMatchLimit as String:kSecMatchLimitOne]; var result: AnyObject?; guard SecItemCopyMatching(q as CFDictionary, &result) == errSecSuccess, let data = result as? Data, let value = String(data:data, encoding:.utf8), !value.isEmpty else { return nil }; return value }
+    static func save(_ value: String) throws { let data = Data(value.utf8); let q: [String: Any] = [kSecClass as String:kSecClassGenericPassword, kSecAttrService as String:service, kSecAttrAccount as String:account]; let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String:data] as CFDictionary); if status == errSecItemNotFound { var add = q; add[kSecValueData as String] = data; guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { throw TransferError(stage:.health, message:"Could not save receiver token") } } else if status != errSecSuccess { throw TransferError(stage:.health, message:"Could not update receiver token") } }
 }
 
-private struct TransferFile: Codable {
-    let path: String
-    let size: Int64
-    let sha256: String
-}
+struct BatchTransferPolicy { let targetBodyBytes: Int64; static let `default` = BatchTransferPolicy(targetBodyBytes: 16 * 1024 * 1024) }
+struct TransferProgress { let sentBytes: Int64; let totalBytes: Int64; let batchIndex: Int; let batchCount: Int }
+struct TransferResult { let sessionID: String; let fileCount: Int }
 
-enum TransferPath {
-    static func canonicalRelativePath(sessionRoot: URL, fileURL: URL) throws -> String {
-        let root = sessionRoot.standardizedFileURL
-        let file = fileURL.standardizedFileURL
-        guard root.isFileURL, file.isFileURL else {
-            throw TransferError(stage: .manifest, message: "Session paths must be file URLs")
-        }
-
-        let rootComponents = root.pathComponents
-        let fileComponents = file.pathComponents
-        guard fileComponents.count > rootComponents.count,
-              Array(fileComponents.prefix(rootComponents.count)) == rootComponents else {
-            throw TransferError(stage: .manifest, message: "File is outside the scan session", filePath: file.path)
-        }
-
-        let relativeComponents = Array(fileComponents.dropFirst(rootComponents.count))
-        guard !relativeComponents.isEmpty else {
-            throw TransferError(stage: .manifest, message: "Session file path is empty")
-        }
-        for component in relativeComponents {
-            guard !component.isEmpty, component != ".", component != "..",
-                  !component.contains("/"), !component.contains("\\") else {
-                throw TransferError(stage: .manifest, message: "Invalid session file path", filePath: component)
-            }
-        }
-        return relativeComponents.joined(separator: "/")
-    }
-
-    static func localURL(sessionRoot: URL, relativePath: String) -> URL {
-        relativePath.split(separator: "/", omittingEmptySubsequences: false)
-            .reduce(sessionRoot) { $0.appendingPathComponent(String($1), isDirectory: false) }
-    }
-}
-
-private struct TransferManifest: Codable {
-    let protocolVersion: Int
-    let sessionID: String
-    let files: [TransferFile]
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol_version"
-        case sessionID = "session_id"
-        case files
-    }
-}
-
-private struct BeginResponse: Codable {
-    let protocolVersion: Int
-    let status: String
-    let sessionID: String
-    let missing: [String]?
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol_version"
-        case status
-        case sessionID = "session_id"
-        case missing
-    }
-}
-
-struct FinalizeAck: Codable {
-    let protocolVersion: Int
-    let status: String
-    let sessionID: String
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol_version"
-        case status
-        case sessionID = "session_id"
-    }
-}
-
-private struct HealthResponse: Codable {
-    let protocolVersion: Int
-    let status: String
-
-    enum CodingKeys: String, CodingKey {
-        case protocolVersion = "protocol_version"
-        case status
-    }
-}
-
-struct TransferResult {
-    let sessionID: String
-    let fileCount: Int
-}
+private struct StartRequest: Codable { let protocolVersion:Int; let sessionID:String; let frameCount:Int; let batchCount:Int; let totalBytes:Int64; enum CodingKeys:String,CodingKey { case protocolVersion="protocol_version", sessionID="session_id", frameCount="frame_count", batchCount="batch_count", totalBytes="total_bytes" } }
+private struct UploadStatus: Codable { let protocolVersion:Int; let sessionID:String; let receivedBatches:[Int]; let receivedBytes:Int64; enum CodingKeys:String,CodingKey { case protocolVersion="protocol_version", sessionID="session_id", receivedBatches="received_batches", receivedBytes="received_bytes" } }
+private struct FinalizeRequest: Codable { let protocolVersion:Int; let sessionID:String; enum CodingKeys:String,CodingKey { case protocolVersion="protocol_version", sessionID="session_id" } }
+struct FinalizeAck: Codable { let protocolVersion:Int; let status:String; let sessionID:String; enum CodingKeys:String,CodingKey { case protocolVersion="protocol_version", status, sessionID="session_id" } }
+private struct HealthResponse: Codable { let protocolVersion:Int; let status:String; enum CodingKeys:String,CodingKey { case protocolVersion="protocol_version", status } }
+private struct BatchPart: Codable { let path:String; let size:Int64; let sha256:String }
+private struct BatchDescriptor { let index:Int; let parts:[BatchPart]; var sourceBytes:Int64 { parts.reduce(0) { $0 + $1.size } } }
 
 final class SessionTransferService {
-    static let protocolVersion = 1
+    static let protocolVersion = 2
+    static let batchMagic = Data("IPHONE3D-BATCH-V2\n".utf8)
+    private let fileManager = FileManager.default; private let captureService: FrameCaptureService; private let session: URLSession; private let policy: BatchTransferPolicy
+    init(captureService: FrameCaptureService, session: URLSession = .shared, policy: BatchTransferPolicy = .default) { self.captureService=captureService; self.session=session; self.policy=policy }
 
-    private let fileManager = FileManager.default
-    private let captureService: FrameCaptureService
-    private let session: URLSession
-    private let policy: TransferPolicy
-
-    init(captureService: FrameCaptureService, session: URLSession = .shared, policy: TransferPolicy = .default) {
-        self.captureService = captureService
-        self.session = session
-        self.policy = policy
+    func transfer(sessionID:String, serverURLString:String, authToken:String, progress:@escaping (TransferProgress)->Void) async throws -> TransferResult {
+        let base = try receiverURL(serverURLString); let root = try captureService.sessionDirectory(for:sessionID); let metadata = try completedMetadata(sessionID:sessionID, directory:root); let plan = try makePlan(root:root, frameCount:metadata.frameCount); let total = plan.reduce(0) { $0 + $1.sourceBytes }
+        let start = StartRequest(protocolVersion:Self.protocolVersion, sessionID:sessionID, frameCount:metadata.frameCount, batchCount:plan.count, totalBytes:total)
+        let status = try await post(endpoint(base,["api","v2","sessions",sessionID,"start"]), body:try JSONEncoder().encode(start), token:authToken, stage:.start, type:UploadStatus.self)
+        guard status.protocolVersion == Self.protocolVersion, status.sessionID == sessionID else { throw TransferError(stage:.start,message:"Protocol or session ID mismatch") }
+        var received = Set(status.receivedBatches); var sent = plan.filter { received.contains($0.index) }.reduce(Int64(0)) { $0 + $1.sourceBytes }
+        for descriptor in plan where !received.contains(descriptor.index) {
+            let batch = try buildBatch(descriptor, root:root); defer { try? fileManager.removeItem(at:batch.url) }
+            try await upload(endpoint(base,["api","v2","sessions",sessionID,"batches",String(descriptor.index)]), batch:batch, token:authToken, index:descriptor.index)
+            received.insert(descriptor.index); sent += descriptor.sourceBytes; progress(TransferProgress(sentBytes:min(sent,total),totalBytes:total,batchIndex:descriptor.index+1,batchCount:plan.count))
+        }
+        let ack = try await post(endpoint(base,["api","v2","sessions",sessionID,"finalize"]), body:try JSONEncoder().encode(FinalizeRequest(protocolVersion:Self.protocolVersion,sessionID:sessionID)), token:authToken, stage:.finalize, type:FinalizeAck.self)
+        guard Self.canDeleteLocalSession(localSessionID:sessionID, ack:ack) else { throw TransferError(stage:.acknowledgement,message:"Missing or invalid VERIFIED acknowledgement") }
+        try captureService.deleteSession(sessionID:sessionID); return TransferResult(sessionID:sessionID,fileCount:plan.reduce(0) { $0 + $1.parts.count })
     }
 
-    func transfer(sessionID: String, serverURLString: String, authToken: String) async throws -> TransferResult {
-        var lastError: Error?
-        for attempt in 0..<3 {
-            do {
-                return try await transferOnce(sessionID: sessionID, serverURLString: serverURLString, authToken: authToken)
-            } catch {
-                lastError = error
-                guard let transferError = error as? TransferError,
-                      Self.shouldRetryReconciliation(transferError),
-                      attempt < 2 else {
-                    throw error
-                }
-                let delay = UInt64(1 << attempt)
-                print("TRANSFER reconciliation retry attempt=\(attempt + 2) delay_seconds=\(delay)")
-                try await Task.sleep(for: .seconds(delay))
-            }
-        }
-        throw lastError ?? TransferError(stage: .finalize, message: "Transfer failed")
-    }
+    func testConnection(serverURLString:String, authToken:String) async throws { let base=try receiverURL(serverURLString); var req=request(endpoint(base,["api","v2","health"]),method:"GET",token:authToken,contentType:"application/json"); req.httpBody=nil; let(data,response)=try await session.data(for:req); try validate(response,data:data,stage:.health); let health=try JSONDecoder().decode(HealthResponse.self,from:data); guard health.protocolVersion == Self.protocolVersion, health.status == "ok" else { throw TransferError(stage:.health,message:"Unexpected receiver health response") } }
+    static func canDeleteLocalSession(localSessionID:String, ack:FinalizeAck)->Bool { ack.protocolVersion == protocolVersion && ack.status == "verified" && ack.sessionID == localSessionID }
 
-    private func transferOnce(sessionID: String, serverURLString: String, authToken: String) async throws -> TransferResult {
-        guard let serverURL = URL(string: serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = serverURL.scheme,
-              ["http", "https"].contains(scheme),
-              serverURL.host != nil
-        else { throw TransferError.invalidServerURL }
-
-        let sessionDirectory = try captureService.sessionDirectory(for: sessionID)
-        guard fileManager.fileExists(atPath: sessionDirectory.path) else { throw TransferError.sessionNotFound }
-        let manifest = try makeManifest(sessionID: sessionID, directory: sessionDirectory)
-        let encoder = JSONEncoder()
-        let beginBody: Data
-        do {
-            beginBody = try encoder.encode(manifest)
-        } catch {
-            throw TransferError(stage: .begin, message: "Cannot encode manifest", underlying: error)
-        }
-        print("TRANSFER manifest files=\(manifest.files.count) payload_bytes=\(beginBody.count)")
-        let begin = try await post(
-            endpoint(serverURL, components: ["v1", "sessions", "begin"]),
-            body: beginBody,
-            token: authToken,
-            stage: .begin,
-            decode: BeginResponse.self
-        )
-        guard begin.protocolVersion == Self.protocolVersion, begin.sessionID == sessionID else {
-            throw TransferError(stage: .begin, message: "Protocol or session ID mismatch in BEGIN response")
-        }
-        if begin.status == "verified" {
-            guard Self.canDeleteLocalSession(localSessionID: sessionID, ack: FinalizeAck(protocolVersion: begin.protocolVersion, status: begin.status, sessionID: begin.sessionID))
-            else { throw TransferError(stage: .ackValidation, message: "Invalid VERIFIED BEGIN acknowledgement") }
-            try captureService.deleteSession(sessionID: sessionID)
-            return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
-        }
-        guard begin.status == "ready" else { throw TransferError(stage: .begin, message: "Unexpected BEGIN status: \(begin.status)") }
-
-        let filesByPath = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
-        var missingFiles: [TransferFile] = []
-        for relativePath in begin.missing ?? [] {
-            guard let expected = filesByPath[relativePath] else { throw TransferError(stage: .upload, message: "Receiver requested a file not present in manifest", filePath: relativePath) }
-            missingFiles.append(expected)
-        }
-        let cursor = TransferUploadCursor(files: missingFiles)
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            let workerCount = min(policy.maxConcurrentUploads, max(1, missingFiles.count))
-            for _ in 0..<workerCount {
-                group.addTask {
-                    while let expected = await cursor.next() {
-                        let localURL = TransferPath.localURL(sessionRoot: sessionDirectory, relativePath: expected.path)
-                        guard self.fileManager.fileExists(atPath: localURL.path) else {
-                            throw TransferError(stage: .upload, message: "Local file was not found", filePath: expected.path)
-                        }
-                        try await self.upload(
-                            self.endpoint(serverURL, components: ["v1", "sessions", sessionID, "files", expected.path]),
-                            fileURL: localURL,
-                            expected: expected,
-                            token: authToken,
-                            stage: .upload
-                        )
-                    }
-                }
-            }
-            try await group.waitForAll()
-        }
-
-        let verified = try await post(
-            endpoint(serverURL, components: ["v1", "sessions", sessionID, "finalize"]),
-            body: try encodeFinalizeManifest(manifest, encoder: encoder),
-            token: authToken,
-            stage: .finalize,
-            decode: FinalizeAck.self
-        )
-        guard Self.canDeleteLocalSession(localSessionID: sessionID, ack: verified)
-        else { throw TransferError(stage: .ackValidation, message: "Missing or invalid VERIFIED acknowledgement") }
-
-        try captureService.deleteSession(sessionID: sessionID)
-        return TransferResult(sessionID: sessionID, fileCount: manifest.files.count)
-    }
-
-    func testConnection(serverURLString: String, authToken: String) async throws {
-        guard let serverURL = URL(string: serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = serverURL.scheme,
-              ["http", "https"].contains(scheme),
-              serverURL.host != nil else { throw TransferError.invalidServerURL }
-        var request = baseRequest(endpoint(serverURL, components: ["api", "v1", "health"]), method: "GET", contentType: "application/json", token: authToken)
-        request.httpBody = nil
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw TransferError(stage: .health, message: "URLSession health request failed", underlying: error)
-        }
-        try validateHTTP(response, data: data, stage: .health)
-        guard let object = try? JSONDecoder().decode(HealthResponse.self, from: data),
-              object.protocolVersion == Self.protocolVersion,
-              object.status == "ok" else { throw TransferError.invalidAcknowledgement }
-    }
-
-    private func makeManifest(sessionID: String, directory: URL) throws -> TransferManifest {
-        let sessionData: Data
-        do {
-            sessionData = try Data(contentsOf: directory.appendingPathComponent("session.json"))
-        } catch {
-            throw TransferError(stage: .manifest, message: "Cannot read session.json", filePath: "session.json", underlying: error)
-        }
-        guard let metadata = try? JSONDecoder().decode(SessionMetadata.self, from: sessionData),
-              metadata.status == "completed",
-              metadata.sessionID == sessionID
-        else { throw TransferError.invalidSession }
-
-        guard let enumerator = fileManager.enumerator(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { throw TransferError.sessionNotFound }
-        var files: [TransferFile] = []
-        for case let fileURL as URL in enumerator {
-            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-            let relative = try TransferPath.canonicalRelativePath(sessionRoot: directory, fileURL: fileURL)
-            let components = relative.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-            let isSessionMetadata = relative == "session.json"
-            let isFrameFile = components.count == 3
-                && components[0] == "frames"
-                && components[1].count == 6
-                && components[1].allSatisfy { $0.isNumber }
-                && ["rgb.jpg", "depth.f32", "confidence.u8", "frame.json"].contains(components[2])
-            guard isSessionMetadata || isFrameFile else {
-                throw TransferError(stage: .manifest, message: "Unexpected file in completed session", filePath: relative)
-            }
-            let data: Data
-            do {
-                data = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
-            } catch {
-                throw TransferError(stage: .manifest, message: "Cannot read file", filePath: relative, underlying: error)
-            }
-            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            files.append(TransferFile(path: relative, size: Int64(data.count), sha256: digest))
-        }
-        return TransferManifest(protocolVersion: Self.protocolVersion, sessionID: sessionID, files: files.sorted { $0.path < $1.path })
-    }
-
-    private func endpoint(_ base: URL, components: [String]) -> URL {
-        components.reduce(base) { current, component in
-            component.split(separator: "/", omittingEmptySubsequences: true)
-                .reduce(current) { $0.appendingPathComponent(String($1)) }
-        }
-    }
-
-    private func baseRequest(_ url: URL, method: String, contentType: String, token: String) -> URLRequest {
-        var request = URLRequest(url: url)
-        request.httpMethod = method
-        request.setValue(String(Self.protocolVersion), forHTTPHeaderField: "X-Protocol-Version")
-        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        if !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-        return request
-    }
-
-    private func post<T: Decodable>(_ url: URL, body: Data, token: String, stage: TransferStage, decode: T.Type) async throws -> T {
-        var request = baseRequest(url, method: "POST", contentType: "application/json", token: token)
-        request.httpBody = body
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw TransferError(stage: stage, message: "URLSession request failed", underlying: error)
-        }
-        try validateHTTP(response, data: data, stage: stage)
-        do {
-            return try JSONDecoder().decode(T.self, from: data)
-        } catch {
-            throw TransferError(stage: stage, message: "Cannot decode server response", responseBody: boundedBody(data), underlying: error)
-        }
-    }
-
-    private func upload(_ url: URL, fileURL: URL, expected: TransferFile, token: String, stage: TransferStage) async throws {
-        var request = baseRequest(url, method: "PUT", contentType: "application/octet-stream", token: token)
-        request.setValue(String(expected.size), forHTTPHeaderField: "Content-Length")
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.upload(for: request, fromFile: fileURL)
-        } catch {
-            throw TransferError(stage: stage, message: "URLSession upload failed", filePath: expected.path, underlying: error)
-        }
-        try validateHTTP(response, data: data, stage: stage, filePath: expected.path)
-    }
-
-    private func validateHTTP(_ response: URLResponse, data: Data, stage: TransferStage, filePath: String? = nil) throws {
-        guard let http = response as? HTTPURLResponse else { throw TransferError.serverRejected("Invalid HTTP response", stage: stage, filePath: filePath) }
-        guard (200..<300).contains(http.statusCode) else {
-            throw TransferError(stage: stage, message: "Server rejected request", filePath: filePath, statusCode: http.statusCode, responseBody: boundedBody(data))
-        }
-    }
-
-    private func boundedBody(_ data: Data) -> String {
-        String(data: data.prefix(8192), encoding: .utf8) ?? "<non-UTF8 response>"
-    }
-
-    static func canDeleteLocalSession(localSessionID: String, ack: FinalizeAck) -> Bool {
-        ack.protocolVersion == protocolVersion
-            && ack.status == "verified"
-            && ack.sessionID == localSessionID
-    }
-
-    static func shouldRetryReconciliation(_ error: TransferError) -> Bool {
-        if let statusCode = error.statusCode {
-            return error.stage == .finalize && [502, 503, 504].contains(statusCode)
-        }
-        guard error.stage == .finalize, let code = error.underlyingCode else { return false }
-        return [
-            .timedOut,
-            .networkConnectionLost,
-            .cannotConnectToHost,
-            .notConnectedToInternet,
-            .dnsLookupFailed,
-            .secureConnectionFailed
-        ].contains(code)
-    }
-
-    private func encodeFinalizeManifest(_ manifest: TransferManifest, encoder: JSONEncoder) throws -> Data {
-        do {
-            return try encoder.encode(manifest)
-        } catch {
-            throw TransferError(stage: .finalize, message: "Cannot encode finalize manifest", underlying: error)
-        }
-    }
-}
-
-private actor TransferUploadCursor {
-    private let files: [TransferFile]
-    private var index = 0
-
-    init(files: [TransferFile]) {
-        self.files = files
-    }
-
-    func next() -> TransferFile? {
-        guard index < files.count else { return nil }
-        defer { index += 1 }
-        return files[index]
-    }
+    private func completedMetadata(sessionID:String,directory:URL)throws->SessionMetadata { guard let data=try? Data(contentsOf:directory.appendingPathComponent("session.json")), let metadata=try? JSONDecoder().decode(SessionMetadata.self,from:data), metadata.status == "completed", metadata.sessionID == sessionID else { throw TransferError(stage:.plan,message:"Completed session metadata was not found") }; return metadata }
+    private func makePlan(root:URL,frameCount:Int)throws->[BatchDescriptor] { var groups:[[BatchPart]]=[[try part(root,"session.json")]]; for index in 0..<frameCount { let prefix=String(format:"frames/%06d",index); groups.append(try ["rgb.jpg","depth.f32","confidence.u8","frame.json"].map { try part(root,"\(prefix)/\($0)") }) }; var result:[BatchDescriptor]=[]; var current:[BatchPart]=[]; var size:Int64=0; for group in groups { let groupSize=group.reduce(0) { $0+$1.size }; if !current.isEmpty && size+groupSize > policy.targetBodyBytes { result.append(BatchDescriptor(index:result.count,parts:current)); current=[]; size=0 }; current += group; size += groupSize }; if !current.isEmpty { result.append(BatchDescriptor(index:result.count,parts:current)) }; return result }
+    private func part(_ root:URL,_ path:String)throws->BatchPart { let url=localURL(root,path); return BatchPart(path:path,size:try fileSize(url),sha256:try sha256(url)) }
+    private func buildBatch(_ descriptor:BatchDescriptor,root:URL)throws->(url:URL,bytes:Int64,sha256:String) { let dir=fileManager.temporaryDirectory.appendingPathComponent("iphone3d-v2-batches",isDirectory:true); try fileManager.createDirectory(at:dir,withIntermediateDirectories:true); let url=dir.appendingPathComponent("batch-\(UUID().uuidString).bin"); guard fileManager.createFile(atPath:url.path,contents:nil) else { throw TransferError(stage:.batch,message:"Cannot create temporary batch",batchIndex:descriptor.index) }; let output=try FileHandle(forWritingTo:url); defer { try? output.close() }; var hasher=SHA256(); func write(_ data:Data)throws { try output.write(contentsOf:data); hasher.update(data:data) }; try write(Self.batchMagic); let encoder=JSONEncoder(); encoder.outputFormatting=[.sortedKeys]; for part in descriptor.parts { try write(try encoder.encode(part)); try write(Data("\n".utf8)); let input=try FileHandle(forReadingFrom:localURL(root,part.path)); defer { try? input.close() }; var copied:Int64=0; while let chunk=try input.read(upToCount:1024*1024),!chunk.isEmpty { try write(chunk); copied += Int64(chunk.count) }; guard copied == part.size else { throw TransferError(stage:.batch,message:"Source file changed while batching",batchIndex:descriptor.index) }; try write(Data("\n".utf8)) }; return (url,try fileSize(url),hasher.finalize().map { String(format:"%02x",$0) }.joined()) }
+    private func upload(_ url:URL,batch:(url:URL,bytes:Int64,sha256:String),token:String,index:Int) async throws { var req=request(url,method:"PUT",token:token,contentType:"application/vnd.iphone3d.batch-v2"); req.setValue(String(batch.bytes),forHTTPHeaderField:"Content-Length"); req.setValue(batch.sha256,forHTTPHeaderField:"X-Batch-SHA256"); let(data,response)=try await session.upload(for:req,fromFile:batch.url); try validate(response,data:data,stage:.batch,batchIndex:index) }
+    private func post<T:Decodable>(_ url:URL,body:Data,token:String,stage:TransferStage,type:T.Type)async throws->T { var req=request(url,method:"POST",token:token,contentType:"application/json"); req.httpBody=body; let(data,response)=try await session.data(for:req); try validate(response,data:data,stage:stage); do { return try JSONDecoder().decode(T.self,from:data) } catch { throw TransferError(stage:stage,message:"Cannot decode receiver response",responseBody:bodyText(data)) } }
+    private func request(_ url:URL,method:String,token:String,contentType:String)->URLRequest { var req=URLRequest(url:url); req.httpMethod=method; req.setValue(String(Self.protocolVersion),forHTTPHeaderField:"X-Protocol-Version"); req.setValue(contentType,forHTTPHeaderField:"Content-Type"); if !token.isEmpty { req.setValue("Bearer \(token)",forHTTPHeaderField:"Authorization") }; return req }
+    private func receiverURL(_ value:String)throws->URL { guard let url=URL(string:value.trimmingCharacters(in:.whitespacesAndNewlines)),["http","https"].contains(url.scheme ?? ""),url.host != nil else { throw TransferError(stage:.health,message:"Invalid receiver URL") }; return url }
+    private func endpoint(_ base:URL,_ parts:[String])->URL { parts.reduce(base) { $0.appendingPathComponent($1) } }
+    private func localURL(_ root:URL,_ path:String)->URL { path.split(separator:"/").reduce(root) { $0.appendingPathComponent(String($1)) } }
+    private func fileSize(_ url:URL)throws->Int64 { guard let size=try url.resourceValues(forKeys:[.fileSizeKey]).fileSize else { throw TransferError(stage:.plan,message:"Cannot read file size") }; return Int64(size) }
+    private func sha256(_ url:URL)throws->String { let input=try FileHandle(forReadingFrom:url); defer { try? input.close() }; var hasher=SHA256(); while let chunk=try input.read(upToCount:1024*1024),!chunk.isEmpty { hasher.update(data:chunk) }; return hasher.finalize().map { String(format:"%02x",$0) }.joined() }
+    private func validate(_ response:URLResponse,data:Data,stage:TransferStage,batchIndex:Int?=nil)throws { guard let http=response as? HTTPURLResponse else { throw TransferError(stage:stage,message:"Invalid HTTP response",batchIndex:batchIndex) }; guard (200..<300).contains(http.statusCode) else { throw TransferError(stage:stage,message:"Receiver rejected request",batchIndex:batchIndex,statusCode:http.statusCode,responseBody:bodyText(data)) } }
+    private func bodyText(_ data:Data)->String { String(data:data.prefix(8192),encoding:.utf8) ?? "<non-UTF8 response>" }
 }

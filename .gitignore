@@ -10,6 +10,7 @@ __pycache__/
 # Generated scan data and reconstruction outputs
 samples/*
 !samples/.gitkeep
+data/
 pointcloud_*.ply
 **/pointcloud_*.ply
 session_pointcloud_*.ply

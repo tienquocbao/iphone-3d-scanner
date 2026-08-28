@@ -36,17 +36,6 @@ struct ContentView: View {
                     }
 
                     if manager.scanState == .recording {
-                        Text("Captured \(manager.capturedFrameCount)  Uploaded \(manager.uploadedFrameCount)  Processed \(manager.processedFrameCount)")
-                            .font(.caption2.monospaced())
-                        Text("Windows \(manager.liveConnectionStatus)  Backlog \(manager.uploadBacklog)")
-                            .font(.caption2.monospaced())
-                        if manager.failedLiveUploads > 0 {
-                            Text("Live upload failures \(manager.failedLiveUploads); final reconciliation will retry")
-                                .font(.caption2.monospaced())
-                        }
-                    }
-
-                    if manager.scanState == .recording {
                         Button("Stop Scan") {
                             manager.stopScan()
                         }
@@ -66,7 +55,7 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(manager.isTransferring)
-                            Button("Transfer and Delete") {
+                            Button(manager.isTransferring ? "Uploading..." : "Upload") {
                                 manager.transferCompletedSession()
                             }
                             .buttonStyle(.borderedProminent)
@@ -76,6 +65,10 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .disabled(manager.isTransferring)
+                        }
+                        if manager.isTransferring && !manager.uploadProgressText.isEmpty {
+                            Text(manager.uploadProgressText)
+                                .font(.caption.monospaced())
                         }
                         Text("LAN or HTTPS receiver. Local session is deleted only after VERIFIED ACK.")
                             .font(.caption2)
