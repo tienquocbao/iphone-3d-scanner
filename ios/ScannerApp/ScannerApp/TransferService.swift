@@ -18,6 +18,7 @@ struct TransferError: LocalizedError {
     let statusCode: Int?
     let responseBody: String?
     let underlyingDescription: String?
+    let underlyingCode: URLError.Code?
 
     init(
         stage: TransferStage,
@@ -33,6 +34,7 @@ struct TransferError: LocalizedError {
         self.statusCode = statusCode
         self.responseBody = responseBody
         self.underlyingDescription = underlying?.localizedDescription
+        self.underlyingCode = (underlying as? URLError)?.code
     }
 
     var errorDescription: String? {
@@ -221,6 +223,26 @@ final class SessionTransferService {
     }
 
     func transfer(sessionID: String, serverURLString: String, authToken: String) async throws -> TransferResult {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                return try await transferOnce(sessionID: sessionID, serverURLString: serverURLString, authToken: authToken)
+            } catch {
+                lastError = error
+                guard let transferError = error as? TransferError,
+                      Self.shouldRetryReconciliation(transferError),
+                      attempt < 2 else {
+                    throw error
+                }
+                let delay = UInt64(1 << attempt)
+                print("TRANSFER reconciliation retry attempt=\(attempt + 2) delay_seconds=\(delay)")
+                try await Task.sleep(for: .seconds(delay))
+            }
+        }
+        throw lastError ?? TransferError(stage: .finalize, message: "Transfer failed")
+    }
+
+    private func transferOnce(sessionID: String, serverURLString: String, authToken: String) async throws -> TransferResult {
         guard let serverURL = URL(string: serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
               let scheme = serverURL.scheme,
               ["http", "https"].contains(scheme),
@@ -426,6 +448,21 @@ final class SessionTransferService {
         ack.protocolVersion == protocolVersion
             && ack.status == "verified"
             && ack.sessionID == localSessionID
+    }
+
+    static func shouldRetryReconciliation(_ error: TransferError) -> Bool {
+        if let statusCode = error.statusCode {
+            return error.stage == .finalize && [502, 503, 504].contains(statusCode)
+        }
+        guard error.stage == .finalize, let code = error.underlyingCode else { return false }
+        return [
+            .timedOut,
+            .networkConnectionLost,
+            .cannotConnectToHost,
+            .notConnectedToInternet,
+            .dnsLookupFailed,
+            .secureConnectionFailed
+        ].contains(code)
     }
 
     private func encodeFinalizeManifest(_ manifest: TransferManifest, encoder: JSONEncoder) throws -> Data {

@@ -12,12 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from http.client import HTTPConnection
 from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from server import LiveSession, PROTOCOL_VERSION, Handler, Receiver, ThreadingHTTPServer, TransferError, canonical_manifest_bytes, json_bytes, manifest_sha256
+from server import PROTOCOL_VERSION, Handler, Receiver, ThreadingHTTPServer, TransferError, canonical_manifest_bytes, json_bytes, manifest_sha256
 
 
 class ReceiverTests(unittest.TestCase):
@@ -135,55 +133,40 @@ class ReceiverTests(unittest.TestCase):
         status, response = self.request("POST", "/v1/sessions/begin", bad)
         self.assertEqual(status, 400)
 
-    def test_finalize_waits_for_live_processor_before_promoting_staging(self):
+    def test_processor_crash_does_not_affect_receiver_finalize_or_health(self):
         manifest, files = self.manifest()
-        receiver = Receiver(self.storage)
+        receiver = Receiver(self.storage, processor_mode="crash")
         receiver.begin(manifest)
         staging = receiver.staging("abc")
         for path, data in files.items():
             destination = staging / path
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
+        receiver.start_live("abc")
+        self.httpd.receiver = receiver
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and receiver.live_status("abc")["processing_error"] is None:
+            time.sleep(0.05)
+        status, health = self.request("GET", "/api/v1/health", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(health["status"], "ok")
+        self.assertIn("processor exited", receiver.live_status("abc")["processing_error"])
+        self.assertEqual(receiver.finalize(manifest), {"protocol_version": 1, "status": "verified", "session_id": "abc"})
 
-        entered = threading.Event()
-        release = threading.Event()
-        loaded = []
-
-        def load_frame(path):
-            loaded.append(path.name)
-            entered.set()
-            release.wait(timeout=3)
-            return object()
-
-        class FakeVolume:
-            def integrate(self, rgbd, intrinsic, extrinsic):
-                return None
-
-        def prepare(*_args):
-            return SimpleNamespace(rgbd=object(), intrinsic=object(), extrinsic=object())
-
-        result = {}
-        with mock.patch("frame_io.load_frame", side_effect=load_frame), \
-                mock.patch("geometry.depth_to_world_points", return_value=([1], None, None)), \
-                mock.patch("tsdf.prepare_tsdf_frame", side_effect=prepare), \
-                mock.patch("open3d.pipelines.integration.ScalableTSDFVolume", return_value=FakeVolume()):
-            receiver.start_live("abc")
-            self.assertTrue(entered.wait(timeout=2))
-            finalizer = threading.Thread(target=lambda: result.setdefault("value", receiver.finalize(manifest)))
-            finalizer.start()
-            time.sleep(0.1)
-            self.assertTrue(finalizer.is_alive())
-            self.assertTrue(staging.is_dir())
-            self.assertFalse(receiver.completed("abc").exists())
-
-            release.set()
-            finalizer.join(timeout=3)
-
-        self.assertFalse(finalizer.is_alive())
-        self.assertEqual(result["value"], {"protocol_version": 1, "status": "verified", "session_id": "abc"})
-        self.assertFalse(staging.exists())
-        self.assertTrue(receiver.completed("abc").is_dir())
-        self.assertEqual(loaded, ["000000"])
+    def test_hung_processor_is_terminated_and_finalize_verifies_raw_files(self):
+        manifest, files = self.manifest()
+        receiver = Receiver(self.storage, processor_mode="hang")
+        receiver.begin(manifest)
+        staging = receiver.staging("abc")
+        for path, data in files.items():
+            destination = staging / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+        receiver.start_live("abc")
+        started = time.monotonic()
+        result = receiver.finalize(manifest)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(result, {"protocol_version": 1, "status": "verified", "session_id": "abc"})
 
     def test_finalize_waits_for_active_live_put_then_retry_succeeds(self):
         manifest, files = self.manifest()
@@ -347,62 +330,6 @@ class ReceiverTests(unittest.TestCase):
             "application/octet-stream",
         )
         self.assertEqual(status, 400)
-
-    def test_live_processing_failure_blocks_and_retries_same_frame(self):
-        with tempfile.TemporaryDirectory() as directory:
-            staging = Path(directory)
-            for index in (0, 1):
-                frame = staging / "frames" / f"{index:06d}"
-                frame.mkdir(parents=True)
-                for name in ("rgb.jpg", "depth.f32", "confidence.u8", "frame.json"):
-                    (frame / name).write_bytes(b"x")
-
-            loaded_paths = []
-
-            def load_frame(path):
-                loaded_paths.append(path.name)
-                if len(loaded_paths) == 1:
-                    raise ValueError("synthetic processing failure")
-                return object()
-
-            class FakeVolume:
-                def integrate(self, rgbd, intrinsic, extrinsic):
-                    return None
-
-            def prepare(*_args):
-                return SimpleNamespace(rgbd=object(), intrinsic=object(), extrinsic=object())
-
-            with mock.patch("frame_io.load_frame", side_effect=load_frame), \
-                    mock.patch("geometry.depth_to_world_points", return_value=([1, 2], None, None)), \
-                    mock.patch("tsdf.prepare_tsdf_frame", side_effect=prepare), \
-                    mock.patch("open3d.pipelines.integration.ScalableTSDFVolume", return_value=FakeVolume()):
-                live = LiveSession("processing-test", staging)
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline:
-                    status = live.snapshot()
-                    if status["processing_failed_frame"] == 0:
-                        break
-                    time.sleep(0.01)
-                status = live.snapshot()
-                self.assertEqual(status["processed_frames"], 0)
-                self.assertEqual(status["next_processing_frame"], 0)
-                self.assertEqual(status["processing_failed_frame"], 0)
-                self.assertIn("synthetic processing failure", status["processing_error"])
-
-                deadline = time.monotonic() + 4
-                while time.monotonic() < deadline:
-                    if live.snapshot()["processed_frames"] == 2:
-                        break
-                    time.sleep(0.02)
-                live.stop()
-                live.worker.join(timeout=2)
-
-            self.assertEqual(loaded_paths[:3], ["000000", "000000", "000001"])
-            status = live.snapshot()
-            self.assertEqual(status["processed_frames"], 2)
-            self.assertEqual(status["last_frame_index"], 1)
-            self.assertIsNone(status["processing_failed_frame"])
-            self.assertIsNone(status["processing_error"])
 
     def test_final_begin_reconciles_live_staged_frame_files(self):
         manifest, files = self.manifest()

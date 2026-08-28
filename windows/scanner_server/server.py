@@ -125,7 +125,9 @@ def load_verified_receipt(path: Path, session_id: str, manifest_hash: str) -> di
 class LiveSession:
     """Bounded, ordered processing state for one live staging session."""
 
-    def __init__(self, session_id: str, staging: Path):
+    def __init__(self, session_id: str, staging: Path, processor_mode: str = "normal"):
+        from live_processor import LiveProcessor
+
         self.session_id = session_id
         self.staging = staging
         self.lock = threading.Lock()
@@ -145,7 +147,8 @@ class LiveSession:
         self.last_frame_index: int | None = None
         self.processing_fps = 0.0
         self.preview_interval_frames = 10
-        self.tsdf_volume = None
+        self.processor = LiveProcessor(session_id, staging, mode=processor_mode)
+        self.processor.start()
         self.worker = threading.Thread(target=self._run, name=f"live-{session_id}", daemon=True)
         self.worker.start()
 
@@ -196,7 +199,7 @@ class LiveSession:
             self.active_uploads -= 1
             self.condition.notify_all()
 
-    def quiesce(self, timeout: float = 10.0) -> None:
+    def quiesce(self, timeout: float = 10.0) -> str:
         deadline = time.monotonic() + timeout
         with self.condition:
             self.accepting_uploads = False
@@ -207,10 +210,12 @@ class LiveSession:
                 if remaining <= 0:
                     raise QuiesceError("live session could not quiesce: active uploads did not finish")
                 self.condition.wait(timeout=remaining)
+        processor_result = self.processor.stop(timeout=min(2.0, max(0.1, deadline - time.monotonic())))
         remaining = max(0.0, deadline - time.monotonic())
         self.worker.join(timeout=remaining)
         if self.worker.is_alive():
             raise QuiesceError("live session could not quiesce: processor did not stop")
+        return processor_result
 
     def _ready_indexes(self) -> list[int]:
         frames = self.staging / "frames"
@@ -241,46 +246,42 @@ class LiveSession:
                 if self.processing_failed_frame == next_index and retry_wait > 0:
                     self.condition.wait(timeout=retry_wait)
                     continue
-            try:
-                from frame_io import load_frame
-                from geometry import depth_to_world_points
-                from tsdf import TSDFPolicy, prepare_tsdf_frame, write_point_cloud
-                import open3d as o3d
+            if not self.processor.is_alive():
+                self._record_processing_failure(next_index, f"processor exited with code {self.processor.process.exitcode}")
+                return
+            self.processor.submit(next_index)
+            result = None
+            while result is None:
+                if self.stop_requested:
+                    return
+                result = self.processor.poll()
+                if result is None and not self.processor.is_alive():
+                    self._record_processing_failure(next_index, f"processor exited with code {self.processor.process.exitcode}")
+                    return
+            if not result.get("ok"):
+                self._record_processing_failure(next_index, str(result.get("error", "processing failed")))
+                continue
+            with self.condition:
+                self.raw_points = int(result["raw_points"])
+                self.processed_frames = int(result["processed_frames"])
+                self.processing_failed_frame = None
+                self.processing_error = None
+                self.processing_retry_count = 0
+                self.processing_retry_at = 0.0
+                self.last_frame_index = next_index
+                elapsed = max(time.monotonic() - started, 1e-6)
+                self.processing_fps = self.processed_frames / elapsed
+                self.condition.notify_all()
 
-                frame = load_frame(self.staging / "frames" / f"{next_index:06d}")
-                points, _, _ = depth_to_world_points(frame, min_confidence=1)
-                if self.tsdf_volume is None:
-                    policy = TSDFPolicy()
-                    self.tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
-                        voxel_length=policy.voxel_length,
-                        sdf_trunc=policy.sdf_trunc,
-                        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
-                    )
-                prepared = prepare_tsdf_frame(frame, TSDFPolicy())
-                self.tsdf_volume.integrate(prepared.rgbd, prepared.intrinsic, prepared.extrinsic)
-                with self.condition:
-                    self.raw_points += len(points)
-                    self.processed_frames += 1
-                    self.processing_failed_frame = None
-                    self.processing_error = None
-                    self.processing_retry_count = 0
-                    self.processing_retry_at = 0.0
-                    self.last_frame_index = next_index
-                    elapsed = max(time.monotonic() - started, 1e-6)
-                    self.processing_fps = self.processed_frames / elapsed
-                    should_preview = self.processed_frames % self.preview_interval_frames == 0
-                if should_preview:
-                    preview_path = self.staging.parent / ".live" / self.session_id / "preview_pointcloud.ply"
-                    write_point_cloud(preview_path, self.tsdf_volume.extract_point_cloud())
-            except Exception as exc:
-                error = str(exc).strip() or exc.__class__.__name__
-                print(f"LIVE processing failed session={self.session_id} frame={next_index}: {error}", flush=True)
-                with self.condition:
-                    self.processing_failed_frame = next_index
-                    self.processing_error = error[:512]
-                    self.processing_retry_count += 1
-                    self.processing_retry_at = time.monotonic() + min(2 ** (self.processing_retry_count - 1), 5)
-                    self.condition.notify_all()
+    def _record_processing_failure(self, frame_index: int, error: str) -> None:
+        error = error.strip() or "processing failed"
+        print(f"LIVE processing failed session={self.session_id} frame={frame_index}: {error}", flush=True)
+        with self.condition:
+            self.processing_failed_frame = frame_index
+            self.processing_error = error[:512]
+            self.processing_retry_count += 1
+            self.processing_retry_at = time.monotonic() + min(2 ** (self.processing_retry_count - 1), 5)
+            self.condition.notify_all()
 
 
 def safe_relative_path(value: object) -> str:
@@ -327,13 +328,14 @@ def validate_manifest(payload: object) -> tuple[str, dict[str, dict[str, int | s
 
 
 class Receiver:
-    def __init__(self, storage_root: Path):
+    def __init__(self, storage_root: Path, processor_mode: str = "normal"):
         self.storage_root = Path(storage_root).resolve()
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self.live_sessions: dict[str, LiveSession] = {}
         self.live_lock = threading.Lock()
         self.finalization_locks: dict[str, threading.Lock] = {}
         self.finalization_lock = threading.Lock()
+        self.processor_mode = processor_mode
 
     def staging(self, session_id: str) -> Path:
         return self.storage_root / f".session_{session_id}.staging"
@@ -348,7 +350,7 @@ class Receiver:
                 return self.live_sessions[session_id].snapshot()
             staging = self.staging(session_id)
             staging.mkdir(parents=True, exist_ok=True)
-            self.live_sessions[session_id] = LiveSession(session_id, staging)
+            self.live_sessions[session_id] = LiveSession(session_id, staging, processor_mode=self.processor_mode)
             return self.live_sessions[session_id].snapshot()
 
     def live_session(self, session_id: str) -> LiveSession:
@@ -477,20 +479,31 @@ class Receiver:
             return self._finalize_locked(session_id, entries, manifest_hash)
 
     def _finalize_locked(self, session_id: str, entries: dict[str, dict[str, int | str]], manifest_hash: str) -> dict[str, object]:
+        print(f"FINALIZE enter session={session_id}", flush=True)
         final = self.completed(session_id)
         if final.is_dir() and (final / ".verified.json").is_file():
             load_verified_receipt(final / ".verified.json", session_id, manifest_hash)
+            print(f"FINALIZE VERIFIED session={session_id} existing_receipt=1", flush=True)
             return verified_network_ack(session_id)
 
-        live = self.live_session(session_id) if session_id in self.live_sessions else None
+        with self.live_lock:
+            live = self.live_sessions.get(session_id)
         if live is not None:
-            live.quiesce()
+            print(f"FINALIZE stop_live_uploads session={session_id}", flush=True)
+            with live.lock:
+                active_uploads = live.active_uploads
+            print(f"FINALIZE active_uploads={active_uploads} session={session_id}", flush=True)
+            processor_state = live.quiesce()
+            print(f"FINALIZE processor_stop_requested session={session_id}", flush=True)
+            print(f"FINALIZE processor_{processor_state} session={session_id}", flush=True)
         staging = self.staging(session_id)
         if not staging.is_dir():
             raise TransferError("transfer has not been begun")
+        print(f"FINALIZE verify_files session={session_id}", flush=True)
         for relative, entry in entries.items():
             if not self._matches(staging / relative, entry):
                 raise TransferError(f"missing or invalid file: {relative}")
+        print(f"FINALIZE verify_session session={session_id}", flush=True)
         session_path = staging / "session.json"
         try:
             session = json.loads(session_path.read_text(encoding="utf-8"))
@@ -519,9 +532,11 @@ class Receiver:
             if not final.is_dir():
                 raise TransferError("completed session path is not a directory")
             shutil.rmtree(final)
+        print(f"FINALIZE promote session={session_id}", flush=True)
         os.replace(staging, final)
         self._remove_live(session_id)
-        print("FINALIZE validation=PASS", flush=True)
+        print(f"FINALIZE validation=PASS session={session_id}", flush=True)
+        print(f"FINALIZE VERIFIED session={session_id}", flush=True)
         return verified_network_ack(session_id)
 
     @staticmethod

@@ -31,4 +31,27 @@ final class TransferAckTests: XCTestCase {
         let protocolResponse = try JSONDecoder().decode(FinalizeAck.self, from: wrongProtocol)
         XCTAssertFalse(SessionTransferService.canDeleteLocalSession(localSessionID: "session-test", ack: protocolResponse))
     }
+
+    func testOnlyFinalizeTransientFailuresAreRetried() {
+        for status in [502, 503, 504] {
+            XCTAssertTrue(SessionTransferService.shouldRetryReconciliation(
+                TransferError(stage: .finalize, message: "upstream", statusCode: status)
+            ))
+        }
+        XCTAssertFalse(SessionTransferService.shouldRetryReconciliation(
+            TransferError(stage: .finalize, message: "bad request", statusCode: 400)
+        ))
+        XCTAssertFalse(SessionTransferService.shouldRetryReconciliation(
+            TransferError(stage: .begin, message: "unauthorized", statusCode: 401)
+        ))
+    }
+
+    func testFinalizeTransportErrorsAreRetriedButOtherStagesAreNot() {
+        XCTAssertTrue(SessionTransferService.shouldRetryReconciliation(
+            TransferError(stage: .finalize, message: "timeout", underlying: URLError(.timedOut))
+        ))
+        XCTAssertFalse(SessionTransferService.shouldRetryReconciliation(
+            TransferError(stage: .upload, message: "timeout", underlying: URLError(.timedOut))
+        ))
+    }
 }
