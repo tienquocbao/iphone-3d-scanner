@@ -269,7 +269,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                     DispatchQueue.main.async {
                         self.scanState = .completed
                         self.capturedFrameCount = result.frameCount
-                        self.captureStatus = "Session complete locally in \(String(format: \"%.2f\", Date().timeIntervalSince(finalizedAt))) s: \(result.frameCount) frames validated"
+                        self.captureStatus = "Session complete locally in \(String(format: "%.2f", Date().timeIntervalSince(finalizedAt))) s: \(result.frameCount) frames validated"
                     }
             } catch {
                     DispatchQueue.main.async {
