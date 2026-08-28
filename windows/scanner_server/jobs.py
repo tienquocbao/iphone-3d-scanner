@@ -47,16 +47,28 @@ def _worker(session_dir: str, artifact_dir: str, kind: str, device: str) -> None
         _write(job_path, {"state": "running", "kind": kind, "progress": 5, "message": "Reading frames", "device": device, "started_at": started})
         if kind == "pointcloud":
             from frame_io import load_frame
-            from fuse_session import fuse_loaded_frames, session_frame_dirs, write_cloud
+            from fuse_session import _cloud, fuse_loaded_frames, session_frame_dirs, write_cloud
+            from geometry import sample_rgb
+            from point_backend import depth_to_world_points_backend
 
             frame_dirs = session_frame_dirs(Path(session_dir))
             frames = []
             for index, directory in enumerate(frame_dirs):
                 frames.append(load_frame(directory))
                 _write(job_path, {"state": "running", "kind": kind, "progress": int(5 + 45 * (index + 1) / len(frame_dirs)), "message": "Reading frames", "device": device, "started_at": started})
-            result = fuse_loaded_frames(frames)
+            if device == "cuda":
+                import numpy as np
+
+                points, colors = [], []
+                for frame in frames:
+                    frame_points, pixels = depth_to_world_points_backend(frame, "cuda")
+                    points.append(frame_points); colors.append(sample_rgb(frame, pixels))
+                raw = _cloud(np.concatenate(points), np.concatenate(colors))
+                result_cloud = raw.voxel_down_sample(0.005)
+            else:
+                result_cloud = fuse_loaded_frames(frames).voxel_cloud
             _write(job_path, {"state": "running", "kind": kind, "progress": 80, "message": "Writing point cloud", "device": device, "started_at": started})
-            count = write_cloud(Path(artifact_dir) / "pointcloud.ply", result.voxel_cloud)
+            count = write_cloud(Path(artifact_dir) / "pointcloud.ply", result_cloud)
             _write(job_path, {"state": "done", "kind": kind, "progress": 100, "message": "Point cloud complete", "device": device, "point_count": count, "finished_at": time.time()})
         elif kind == "mesh":
             from reconstruct_tsdf import main as tsdf_main
