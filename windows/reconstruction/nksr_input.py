@@ -1,4 +1,9 @@
-"""Prepare provenance-preserving object observations for the optional NKSR backend."""
+"""Prepare provenance-preserving canonical object observations.
+
+The historical public names remain for Gate C2 compatibility.  This module
+does not import NKSR or PyTorch and is also the data source for native surface
+backends through :mod:`surface_input`.
+"""
 
 from __future__ import annotations
 

@@ -42,6 +42,19 @@ the mesh, so missing packages, CUDA failures, and timeouts cannot compromise
 FastAPI or TSDF. NKSR is optional and its consistency metrics are not
 ground-truth accuracy measurements. See [object-nksr.md](object-nksr.md).
 
+## Gate C3 — Windows-native point-based surfaces
+
+Poisson and Ball Pivoting Algorithm (BPA) reconstruct from the same canonical,
+masked object observations without NKSR, CUDA, WSL, or another runtime. Their
+normal preparation preserves aligned points, observing sensor origins, and
+colors through joint voxel aggregation; normals are made sensor-facing before
+either backend runs. Poisson is the smooth point-based candidate and is
+conservatively density-trimmed and safety-cropped to the registered object
+bounds. BPA derives ball radii from measured nearest-neighbor spacing and is a
+geometry-preserving, possibly incomplete comparison backend. Both record the
+Gate B transform SHA so changed registration marks their meshes stale. Backend
+comparison reports captured-point consistency only, not ground-truth accuracy.
+
 ## Later gates
 
 - Gate D: hand robustness, mesh cleanup, texture, and production exports.

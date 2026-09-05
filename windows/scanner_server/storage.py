@@ -228,7 +228,7 @@ class TransferStore:
                     scan_mode = "scene"
                 pass_count = len(metadata.get("passes") or [])
                 artifact_dir = self.artifacts / path.name
-                result.append({"session_id": metadata["session_id"], "frame_count": metadata["frame_count"], "total_bytes": size, "created_at": metadata.get("ended_at_utc"), "state": "ready", "scan_mode": scan_mode, "pass_count": pass_count, "object_reconstruction_ready": _object_reconstruction_ready(artifact_dir, pass_count) if scan_mode == "object" else False, "object_tsdf_state": _object_reconstruction_state(artifact_dir, pass_count, "tsdf") if scan_mode == "object" else None, "object_nksr_state": _object_reconstruction_state(artifact_dir, pass_count, "nksr") if scan_mode == "object" else None})
+                result.append({"session_id": metadata["session_id"], "frame_count": metadata["frame_count"], "total_bytes": size, "created_at": metadata.get("ended_at_utc"), "state": "ready", "scan_mode": scan_mode, "pass_count": pass_count, "object_reconstruction_ready": _object_reconstruction_ready(artifact_dir, pass_count) if scan_mode == "object" else False, "object_tsdf_state": _object_reconstruction_state(artifact_dir, pass_count, "tsdf") if scan_mode == "object" else None, "object_nksr_state": _object_reconstruction_state(artifact_dir, pass_count, "nksr") if scan_mode == "object" else None, "object_poisson_state": _object_reconstruction_state(artifact_dir, pass_count, "poisson") if scan_mode == "object" else None, "object_bpa_state": _object_reconstruction_state(artifact_dir, pass_count, "bpa") if scan_mode == "object" else None})
             except (OSError, KeyError, json.JSONDecodeError):
                 continue
         return result

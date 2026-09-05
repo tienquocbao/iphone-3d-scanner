@@ -125,6 +125,15 @@ def _worker(session_dir: str, artifact_dir: str, kind: str, device: str) -> None
 
             metrics = build_object_nksr(Path(session_dir), Path(artifact_dir), progress=progress)
             _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":metrics.get("device",device),"metrics":metrics,"finished_at":time.time()})
+        elif kind in {"object_poisson", "object_bpa"}:
+            from object_surface import build_object_bpa, build_object_poisson
+
+            def progress(value, message, metrics=None):
+                _write(job_path, {"state":"running","kind":kind,"progress":value,"message":message,"device":"cpu","started_at":started, **({"metrics":metrics} if metrics else {})})
+
+            builder = build_object_poisson if kind == "object_poisson" else build_object_bpa
+            metrics = builder(Path(session_dir), Path(artifact_dir), progress=progress)
+            _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":"cpu","metrics":metrics,"finished_at":time.time()})
         elif kind == "mesh":
             from reconstruct_tsdf import main as tsdf_main
 
@@ -146,12 +155,12 @@ class JobManager:
         self.processes: dict[str, mp.Process] = {}
 
     def start(self, session_id: str, kind: str, device: str = "auto") -> dict[str, object]:
-        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud", "object_tsdf", "object_nksr"}:
+        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud", "object_tsdf", "object_nksr", "object_poisson", "object_bpa"}:
             raise ValueError("unsupported job kind")
         session_dir = self.sessions_root / f"session_{session_id}"
         if not session_dir.is_dir():
             raise ValueError("verified session does not exist")
-        if kind in {"object_pointcloud", "registered_object_pointcloud", "object_tsdf", "object_nksr"}:
+        if kind in {"object_pointcloud", "registered_object_pointcloud", "object_tsdf", "object_nksr", "object_poisson", "object_bpa"}:
             try:
                 metadata = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:

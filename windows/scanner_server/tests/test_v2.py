@@ -108,8 +108,21 @@ class V2ReceiverTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v2/health", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/tsdf/object_tsdf_clean.ply", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/tsdf/reconstruction.json", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.post("/api/v2/sessions/object/jobs", headers=self.headers, json={"kind": "object_poisson", "device": "cpu"}).status_code, 200)
+        self.client.app.state.jobs.processes["object"].join(timeout=15)
+        poisson_state = self.client.get("/api/v2/sessions/object/job", headers=self.headers).json()
+        self.assertEqual(poisson_state["state"], "done", poisson_state)
+        self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/poisson/object_poisson_clean.ply", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.post("/api/v2/sessions/object/jobs", headers=self.headers, json={"kind": "object_bpa", "device": "cpu"}).status_code, 200)
+        self.client.app.state.jobs.processes["object"].join(timeout=15)
+        bpa_state = self.client.get("/api/v2/sessions/object/job", headers=self.headers).json()
+        self.assertEqual(bpa_state["state"], "done", bpa_state)
+        self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/bpa/object_bpa_clean.ply", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/comparison.json", headers=self.headers).status_code, 200)
         listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
         self.assertEqual(listed["object_tsdf_state"], "current")
+        self.assertEqual(listed["object_poisson_state"], "current")
+        self.assertEqual(listed["object_bpa_state"], "current")
         diagnostics = self.client.get("/api/v2/diagnostics", headers=self.headers).json()
         self.assertIn("nksr", diagnostics)
         self.assertFalse(diagnostics["nksr"]["available"])
@@ -148,11 +161,21 @@ class V2ReceiverTests(unittest.TestCase):
         digest = hashlib.sha256(transform.read_bytes()).hexdigest()
         report.write_text(json.dumps({"registration":{"pass_transforms_sha256":digest}}), encoding="utf-8")
         mesh.write_bytes(b"ply")
+        for backend in ("poisson", "bpa"):
+            surface_report = artifact / "reconstruction" / backend / "reconstruction.json"
+            surface_mesh = surface_report.parent / f"object_{backend}_clean.ply"
+            surface_report.parent.mkdir(parents=True, exist_ok=True)
+            surface_report.write_text(json.dumps({"pass_transforms_sha256": digest}), encoding="utf-8")
+            surface_mesh.write_bytes(b"ply")
         listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
         self.assertEqual(listed["object_tsdf_state"], "current")
+        self.assertEqual(listed["object_poisson_state"], "current")
+        self.assertEqual(listed["object_bpa_state"], "current")
         transform.write_text('{"version":2}', encoding="utf-8")
         listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
         self.assertEqual(listed["object_tsdf_state"], "stale")
+        self.assertEqual(listed["object_poisson_state"], "stale")
+        self.assertEqual(listed["object_bpa_state"], "stale")
 
     def test_nksr_artifact_provenance_becomes_stale_with_registration(self) -> None:
         session = self.root / "sessions" / "session_nksr"
@@ -209,6 +232,9 @@ class V2ReceiverTests(unittest.TestCase):
         self.assertIn("STALE", app_js.text)
         self.assertIn("NKSR unavailable", app_js.text)
         self.assertIn("Build Object Mesh (NKSR)", app_js.text)
+        self.assertIn("Build Object Mesh (Poisson)", app_js.text)
+        self.assertIn("Build Object Mesh (BPA)", app_js.text)
+        self.assertIn("Compare object backends", app_js.text)
         self.assertEqual(self.client.get("/viewer.js").status_code, 200)
         self.assertIn("geometry.index !== null", self.client.get("/viewer.js").text)
         self.assertEqual(self.client.get("/vendor/three/three.module.js").status_code, 200)

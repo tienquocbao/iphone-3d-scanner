@@ -91,6 +91,11 @@ async function loadSessions() {
           ...(item.pass_count >= 2 ? [['Build Registered Object Cloud', () => start(item.session_id, 'registered_object_pointcloud')], ['View Registered', () => view(item.session_id, 'registered')]] : []),
           ['Build Object Mesh (TSDF)', () => start(item.session_id, 'object_tsdf')],
           ...(item.object_tsdf_state !== 'missing' ? [['View TSDF Mesh', () => view(item.session_id, 'tsdf')], ['TSDF diagnostics', () => void showTSDFDiagnostics(item.session_id, item.object_tsdf_state)]] : []),
+          ['Build Object Mesh (Poisson)', () => start(item.session_id, 'object_poisson')],
+          ...(item.object_poisson_state !== 'missing' ? [['View Poisson Mesh', () => view(item.session_id, 'poisson')], ['Poisson diagnostics', () => void showSurfaceDiagnostics(item.session_id, 'poisson', item.object_poisson_state)]] : []),
+          ['Build Object Mesh (BPA)', () => start(item.session_id, 'object_bpa')],
+          ...(item.object_bpa_state !== 'missing' ? [['View BPA Mesh', () => view(item.session_id, 'bpa')], ['BPA diagnostics', () => void showSurfaceDiagnostics(item.session_id, 'bpa', item.object_bpa_state)]] : []),
+          ...((item.object_tsdf_state !== 'missing' || item.object_poisson_state !== 'missing' || item.object_bpa_state !== 'missing') ? [['Compare object backends', () => void showSurfaceComparison(item.session_id)]] : []),
           ...(nksrCapability?.available && item.object_reconstruction_ready
             ? [['Build Object Mesh (NKSR)', () => start(item.session_id, 'object_nksr')]]
             : [[nksrCapability?.available ? 'NKSR registration required' : nksrCapability ? 'NKSR unavailable' : 'NKSR capability checking…', () => {}, true, nksrCapability?.available ? 'Build the required object cloud/registration first' : nksrCapability?.reason || 'Checking optional backend']]),
@@ -158,6 +163,8 @@ async function poll(id, kind) {
       if (kind === 'object_pointcloud') void showObjectDiagnostics(id);
       if (kind === 'object_tsdf') void showTSDFDiagnostics(id, 'current');
       if (kind === 'object_nksr') void showNKSRDiagnostics(id, 'current');
+      if (kind === 'object_poisson') void showSurfaceDiagnostics(id, 'poisson', 'current');
+      if (kind === 'object_bpa') void showSurfaceDiagnostics(id, 'bpa', 'current');
       void loadSessions();
     }
   } catch (error) {
@@ -171,6 +178,10 @@ async function view(id, objectCloud) {
     viewerModule ||= await import('./viewer.js?v=2');
     const artifactNames = objectCloud === 'nksr'
       ? ['object/reconstruction/nksr/object_nksr_clean.ply']
+      : objectCloud === 'poisson'
+        ? ['object/reconstruction/poisson/object_poisson_clean.ply']
+        : objectCloud === 'bpa'
+          ? ['object/reconstruction/bpa/object_bpa_clean.ply']
       : objectCloud === 'tsdf'
         ? ['object/reconstruction/tsdf/object_tsdf_clean.ply']
       : objectCloud === 'registered'
@@ -261,6 +272,63 @@ async function showNKSRDiagnostics(id, state) {
       const metric = document.createElement('p');
       metric.textContent = `${label} observed-point distance — median: ${value.median_m.toFixed(4)} m; p95: ${value.p95_m.toFixed(4)} m`;
       objectDiagnostics.append(metric);
+    }
+  } catch (error) {
+    objectDiagnostics.textContent = sessionErrorMessage(error);
+  }
+}
+
+async function showSurfaceDiagnostics(id, backend, state) {
+  clearObjectDiagnostics();
+  try {
+    const report = await api(`/api/v2/sessions/${id}/artifacts/object/reconstruction/${backend}/reconstruction.json`);
+    const mesh = report.mesh.clean;
+    const summary = document.createElement('p');
+    summary.textContent = `Object mesh — Backend: ${backend.toUpperCase()}; Input points: ${report.input_points}; Vertices: ${mesh.vertices}; Triangles: ${mesh.triangles}; Processing: ${report.processing_seconds.toFixed(2)} s`;
+    objectDiagnostics.append(summary);
+    if (backend === 'poisson') {
+      const density = report.density_filter;
+      const details = document.createElement('p');
+      details.textContent = `Poisson density trim — threshold: ${density.threshold.toFixed(3)}; removed vertices: ${density.removed_vertices}`;
+      objectDiagnostics.append(details);
+    } else {
+      const details = document.createElement('p');
+      details.textContent = `BPA radii: ${(report.bpa.ball_radii_m || []).map((value) => value.toFixed(4)).join(', ')} m`;
+      objectDiagnostics.append(details);
+    }
+    const normal = report.normal_diagnostics;
+    const normalDetails = document.createElement('p');
+    normalDetails.textContent = `Normals: ${normal.orientation_method}; sensor flips: ${normal.flipped_by_sensor_count}; radius: ${normal.normal_radius_m.toFixed(4)} m`;
+    objectDiagnostics.append(normalDetails);
+    if (state === 'stale') {
+      const warning = document.createElement('p');
+      warning.textContent = `STALE — object registration changed; rebuild the ${backend.toUpperCase()} mesh.`;
+      objectDiagnostics.append(warning);
+    }
+    for (const warningText of report.warnings || []) {
+      const warning = document.createElement('p');
+      warning.textContent = `Warning: ${warningText}`;
+      objectDiagnostics.append(warning);
+    }
+  } catch (error) {
+    objectDiagnostics.textContent = sessionErrorMessage(error);
+  }
+}
+
+async function showSurfaceComparison(id) {
+  clearObjectDiagnostics();
+  try {
+    const report = await api(`/api/v2/sessions/${id}/artifacts/object/reconstruction/comparison.json`);
+    const note = document.createElement('p');
+    note.textContent = report.note;
+    objectDiagnostics.append(note);
+    for (const [backend, value] of Object.entries(report.backends || {})) {
+      const consistency = value.observed_point_consistency;
+      const line = document.createElement('p');
+      const runtime = value.runtime_seconds == null ? '-' : `${Number(value.runtime_seconds).toFixed(2)} s`;
+      const observed = consistency ? `; observed median/p95: ${consistency.median_m.toFixed(4)}/${consistency.p95_m.toFixed(4)} m` : '';
+      line.textContent = `${backend.toUpperCase()} — ${value.vertices} vertices, ${value.triangles} triangles, ${runtime}${observed}`;
+      objectDiagnostics.append(line);
     }
   } catch (error) {
     objectDiagnostics.textContent = sessionErrorMessage(error);
