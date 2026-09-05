@@ -21,6 +21,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var authTokenText = ""
     @Published var isTransferring = false
     @Published var uploadProgressText = ""
+    @Published var selectedScanMode: ScanMode = .scene
 
     private let captureService = FrameCaptureService()
     private lazy var transferService = SessionTransferService(captureService: captureService)
@@ -35,6 +36,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     private var sessionBytes: Int64 = 0
     private var sessionStartedAt = Date()
     private var writePending = false
+    private var recordingScanMode: ScanMode = .scene
 
     override init() {
         super.init()
@@ -202,9 +204,10 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         let startDate = Date()
         do {
             _ = try captureService.initializeSession(
-                sessionID: newSessionID,
-                startedAt: startDate,
-                policy: recordingPolicy
+            sessionID: newSessionID,
+            startedAt: startDate,
+            policy: recordingPolicy,
+            scanMode: selectedScanMode
             )
         } catch {
             reportScanError("Cannot create session: \(error.localizedDescription)")
@@ -220,6 +223,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         nextFrameIndex = 0
         sessionBytes = 0
         sessionStartedAt = startDate
+        recordingScanMode = selectedScanMode
         writePending = false
         keyframeSelector.reset()
         recording = true
@@ -264,7 +268,8 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                         sessionID: finishingSessionID,
                         frameCount: self.successfulFrameCount,
                         totalBytes: self.sessionBytes,
-                        startedAt: finishingStartedAt
+                        startedAt: finishingStartedAt,
+                        scanMode: self.recordingScanMode
                     )
                     DispatchQueue.main.async {
                         self.scanState = .completed

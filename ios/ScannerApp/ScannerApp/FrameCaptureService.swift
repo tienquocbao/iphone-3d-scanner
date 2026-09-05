@@ -196,7 +196,8 @@ final class FrameCaptureService {
     func initializeSession(
         sessionID: String,
         startedAt: Date,
-        policy: RecordingPolicy
+        policy: RecordingPolicy,
+        scanMode: ScanMode
     ) throws -> URL {
         let sessionDirectory = try sessionDirectory(for: sessionID)
         let metadata = SessionMetadata(
@@ -211,7 +212,9 @@ final class FrameCaptureService {
             captureMode: "keyframe",
             recordingPolicy: policy.metadata,
             sensor: SensorMetadata(depthUnit: "meters", coordinateSystem: "ARKit"),
-            validation: nil
+            validation: nil,
+            scanMode: scanMode,
+            passes: scanMode == .object ? [] : nil
         )
         try JSONEncoder().encodedSessionMetadata(metadata).write(
             to: sessionDirectory.appendingPathComponent("session.json"),
@@ -224,7 +227,8 @@ final class FrameCaptureService {
         sessionID: String,
         frameCount: Int,
         totalBytes: Int64,
-        startedAt: Date
+        startedAt: Date,
+        scanMode: ScanMode
     ) throws -> SessionFinalizationResult {
         let sessionDirectory = try sessionDirectory(for: sessionID)
         let framesDirectory = sessionDirectory.appendingPathComponent(
@@ -262,7 +266,11 @@ final class FrameCaptureService {
                 valid: true,
                 checkedFrames: checkedFrames,
                 message: "All frame files and metadata validated"
-            )
+            ),
+            scanMode: scanMode,
+            passes: scanMode == .object && frameCount > 0
+                ? [ScanPassMetadata(id: 0, startFrame: 0, endFrame: frameCount - 1)]
+                : nil
         )
         let sessionData = try JSONEncoder().encodedSessionMetadata(metadata)
         try sessionData.write(

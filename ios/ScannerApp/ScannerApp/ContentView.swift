@@ -74,13 +74,21 @@ struct ContentView: View {
                             .font(.caption2)
                             .multilineTextAlignment(.center)
                     } else {
+                        Picker("Scan Mode", selection: $manager.selectedScanMode) {
+                            ForEach(ScanMode.allCases) { mode in
+                                Text(mode.displayName).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
                         Button("Start Scan") {
                             manager.startScan()
                         }
                         .buttonStyle(.borderedProminent)
                     }
 
-                    Text("Move the phone slowly")
+                    Text(manager.selectedScanMode == .object
+                         ? "Object mode: scan one stationary object against a green background"
+                         : "Move the phone slowly")
                         .font(.footnote)
                 }
                 .padding(.horizontal, 16)

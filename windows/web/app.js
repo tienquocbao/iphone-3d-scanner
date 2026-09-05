@@ -3,6 +3,7 @@ const rows = document.querySelector('#sessions');
 const job = document.querySelector('#job');
 const dashboardStatus = document.querySelector('#dashboard-status');
 const diagnostics = document.querySelector('#diagnostics');
+const objectDiagnostics = document.querySelector('#object-diagnostics');
 
 token.value = localStorage.getItem('iphone3d-token') || '';
 
@@ -51,7 +52,7 @@ function showSessionMessage(message) {
   rows.replaceChildren();
   const row = document.createElement('tr');
   const cell = document.createElement('td');
-  cell.colSpan = 5;
+  cell.colSpan = 6;
   cell.textContent = message;
   row.append(cell);
   rows.append(row);
@@ -75,16 +76,21 @@ async function loadSessions() {
     dashboardStatus.textContent = `${data.sessions.length} verified session${data.sessions.length === 1 ? '' : 's'}`;
     for (const item of data.sessions) {
       const row = document.createElement('tr');
-      for (const value of [item.session_id, item.frame_count, bytes(item.total_bytes), item.created_at || '-']) {
+      for (const value of [item.session_id, item.scan_mode === 'object' ? 'Object' : 'Scene', item.frame_count, bytes(item.total_bytes), item.created_at || '-']) {
         const cell = document.createElement('td');
         cell.textContent = value;
         row.append(cell);
       }
       const actions = document.createElement('td');
       for (const [label, action] of [
+        ...(item.scan_mode === 'object' ? [
+          ['Build Object Point Cloud', () => start(item.session_id, 'object_pointcloud')],
+          ['View Object Cloud', () => view(item.session_id, true)],
+          ['Mask diagnostics', () => void showObjectDiagnostics(item.session_id)],
+        ] : []),
         ['Build point cloud', () => start(item.session_id, 'pointcloud')],
         ['Build mesh', () => start(item.session_id, 'mesh')],
-        ['View', () => view(item.session_id)],
+        ['View', () => view(item.session_id, false)],
       ]) {
         const button = document.createElement('button');
         button.type = 'button';
@@ -124,30 +130,68 @@ async function start(id, kind) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind, device: 'auto' }),
     });
-    void poll(id);
+    void poll(id, kind);
   } catch (error) {
     job.textContent = sessionErrorMessage(error);
   }
 }
 
-async function poll(id) {
+async function poll(id, kind) {
   try {
     const state = await api(`/api/v2/sessions/${id}/job`);
     job.textContent = `${state.state.toUpperCase()} ${state.progress || 0}% — ${state.message || ''}`;
     if (!['done', 'failed'].includes(state.state)) setTimeout(() => void poll(id), 1000);
-    else if (state.state === 'done') void loadSessions();
+    else if (state.state === 'done') {
+      if (kind === 'object_pointcloud') void showObjectDiagnostics(id);
+      void loadSessions();
+    }
   } catch (error) {
     job.textContent = sessionErrorMessage(error);
   }
 }
 
 let viewerModule;
-async function view(id) {
+async function view(id, objectCloud) {
   try {
     viewerModule ||= await import('./viewer.js?v=2');
-    await viewerModule.viewSession(id, { headers, job });
+    await viewerModule.viewSession(id, { headers, job, artifactNames: objectCloud ? ['object/object_clean.ply'] : undefined });
   } catch {
     job.textContent = '3D viewer unavailable';
+  }
+}
+
+function clearObjectDiagnostics() {
+  objectDiagnostics.replaceChildren();
+}
+
+async function showObjectDiagnostics(id) {
+  clearObjectDiagnostics();
+  try {
+    const report = await api(`/api/v2/sessions/${id}/artifacts/object/processing.json`);
+    const summary = document.createElement('p');
+    summary.textContent = `Object diagnostics — Frames: ${report.processed_frames}/${report.input_frames}; Foreground points: ${report.foreground_points}; Clean points: ${report.clean_points}; Processing: ${report.timing_seconds.total.toFixed(2)} s`;
+    objectDiagnostics.append(summary);
+    for (const mask of report.outputs.diagnostic_masks || []) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = `Preview mask ${mask}`;
+      button.onclick = async () => {
+        try {
+          viewerModule ||= await import('./viewer.js?v=2');
+          await viewerModule.showMask(id, mask, { headers, job });
+        } catch {
+          job.textContent = '3D viewer unavailable';
+        }
+      };
+      objectDiagnostics.append(button);
+    }
+    for (const warning of report.warnings || []) {
+      const warningText = document.createElement('p');
+      warningText.textContent = `Warning: ${warning}`;
+      objectDiagnostics.append(warningText);
+    }
+  } catch (error) {
+    objectDiagnostics.textContent = sessionErrorMessage(error);
   }
 }
 

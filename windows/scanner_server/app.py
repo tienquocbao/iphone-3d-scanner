@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import hmac
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -33,7 +34,7 @@ class FinalizePayload(BaseModel):
 
 
 class JobPayload(BaseModel):
-    kind: Literal["pointcloud", "mesh"]
+    kind: Literal["pointcloud", "mesh", "object_pointcloud"]
     device: Literal["auto", "cpu", "cuda"] = "auto"
 
 
@@ -128,9 +129,11 @@ def create_app(storage_root: Path, bearer_token: str = "") -> FastAPI:
                 await asyncio.sleep(1)
         return StreamingResponse(stream(), media_type="text/event-stream")
 
-    @app.get("/api/v2/sessions/{session_id}/artifacts/{name}")
+    @app.get("/api/v2/sessions/{session_id}/artifacts/{name:path}")
     def artifact(session_id: str, name: str, _: None = Depends(authorize)) -> FileResponse:
-        if name not in {"pointcloud.ply", "mesh_mesh_clean.ply", "mesh_mesh_raw.ply", "mesh_tsdf_pointcloud.ply", "job.json"}:
+        allowed = {"pointcloud.ply", "mesh_mesh_clean.ply", "mesh_mesh_raw.ply", "mesh_tsdf_pointcloud.ply", "job.json", "object/object_raw.ply", "object/object_clean.ply", "object/processing.json"}
+        valid_mask = bool(re.fullmatch(r"object/masks/[0-9]{6}\.png", name))
+        if name not in allowed and not valid_mask:
             raise HTTPException(404, "artifact not found")
         path = store.artifacts / f"session_{session_id}" / name
         if not path.is_file():

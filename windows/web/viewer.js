@@ -9,7 +9,10 @@ let renderer;
 let controls;
 
 function setup() {
-  if (renderer) return;
+  if (renderer) {
+    if (!renderer.domElement.isConnected) viewer.replaceChildren(renderer.domElement);
+    return;
+  }
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x090d13);
   camera = new THREE.PerspectiveCamera(55, viewer.clientWidth / viewer.clientHeight, 0.01, 1000);
@@ -32,14 +35,17 @@ async function artifact(id, name, headers) {
   return response.ok ? response : null;
 }
 
-export async function viewSession(id, { headers, job }) {
+export async function viewSession(id, { headers, job, artifactNames = ['pointcloud.ply', 'mesh_mesh_clean.ply'] }) {
   setup();
   while (scene.children.length > 1) scene.remove(scene.children.at(-1));
-  let response = await artifact(id, 'pointcloud.ply', headers);
-  let mesh = false;
-  if (!response) {
-    response = await artifact(id, 'mesh_mesh_clean.ply', headers);
-    mesh = true;
+  let response = null;
+  let selectedName = '';
+  for (const name of artifactNames) {
+    response = await artifact(id, name, headers);
+    if (response) {
+      selectedName = name;
+      break;
+    }
   }
   if (!response) {
     job.textContent = 'No point cloud or mesh artifact is available yet';
@@ -47,6 +53,7 @@ export async function viewSession(id, { headers, job }) {
   }
   const geometry = new PLYLoader().parse(await response.arrayBuffer());
   geometry.computeBoundingSphere();
+  const mesh = selectedName.includes('mesh_');
   const material = mesh
     ? new THREE.MeshStandardMaterial({ vertexColors: geometry.hasAttribute('color'), color: 0x78aaff, side: THREE.DoubleSide })
     : geometry.hasAttribute('color')
@@ -56,4 +63,18 @@ export async function viewSession(id, { headers, job }) {
   controls.target.copy(geometry.boundingSphere.center);
   camera.position.copy(geometry.boundingSphere.center).addScalar(Math.max(geometry.boundingSphere.radius * 2, 0.5));
   job.textContent = `Viewing ${id}`;
+}
+
+export async function showMask(id, name, { headers, job }) {
+  const response = await artifact(id, `object/masks/${name}`, headers);
+  if (!response) {
+    job.textContent = 'Foreground mask is unavailable';
+    return;
+  }
+  const image = document.createElement('img');
+  image.alt = `Foreground mask ${name}`;
+  image.src = URL.createObjectURL(await response.blob());
+  image.onload = () => URL.revokeObjectURL(image.src);
+  viewer.replaceChildren(image);
+  job.textContent = `Foreground mask ${name}`;
 }

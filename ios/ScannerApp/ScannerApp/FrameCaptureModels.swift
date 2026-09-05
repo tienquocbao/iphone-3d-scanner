@@ -8,6 +8,26 @@ enum ScanState: String {
     case error = "ERROR"
 }
 
+enum ScanMode: String, Codable, CaseIterable, Identifiable {
+    case scene
+    case object
+
+    var id: String { rawValue }
+    var displayName: String { rawValue.capitalized }
+}
+
+struct ScanPassMetadata: Codable, Equatable {
+    let id: Int
+    let startFrame: Int
+    let endFrame: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case startFrame = "start_frame"
+        case endFrame = "end_frame"
+    }
+}
+
 struct FrameMetadata: Codable {
     let schemaVersion: Int
     let frameIndex: Int
@@ -187,6 +207,8 @@ struct SessionMetadata: Codable {
     let recordingPolicy: RecordingPolicyMetadata
     let sensor: SensorMetadata
     let validation: SessionValidation?
+    let scanMode: ScanMode?
+    let passes: [ScanPassMetadata]?
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -201,6 +223,8 @@ struct SessionMetadata: Codable {
         case recordingPolicy = "recording_policy"
         case sensor
         case validation
+        case scanMode = "scan_mode"
+        case passes
     }
 }
 
