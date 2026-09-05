@@ -16,10 +16,33 @@ PROTOCOL_VERSION = 2
 MAGIC = b"IPHONE3D-BATCH-V2\n"
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 FRAME_FILES = {"rgb.jpg", "depth.f32", "confidence.u8", "frame.json"}
+SINGLE_PASS_TRANSFORM_ID = "single-pass-identity-v1"
 
 
 class StorageError(ValueError):
     pass
+
+
+def _object_tsdf_state(artifact_dir: Path, pass_count: int) -> str:
+    """Return missing/current/stale without importing reconstruction dependencies."""
+
+    report_path = artifact_dir / "object" / "reconstruction" / "tsdf" / "reconstruction.json"
+    mesh_path = artifact_dir / "object" / "reconstruction" / "tsdf" / "object_tsdf_clean.ply"
+    if not report_path.is_file() or not mesh_path.is_file():
+        return "missing"
+    transform_path = artifact_dir / "object" / "registration" / "pass_transforms.json"
+    if pass_count > 1:
+        if not transform_path.is_file():
+            return "stale"
+        current = sha256_file(transform_path)
+    else:
+        current = SINGLE_PASS_TRANSFORM_ID
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        recorded = report["registration"]["pass_transforms_sha256"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return "stale"
+    return "current" if recorded == current else "stale"
 
 
 def safe_session_id(value: str) -> str:
@@ -185,7 +208,9 @@ class TransferStore:
                 scan_mode = metadata.get("scan_mode", "scene")
                 if scan_mode not in {"scene", "object"}:
                     scan_mode = "scene"
-                result.append({"session_id": metadata["session_id"], "frame_count": metadata["frame_count"], "total_bytes": size, "created_at": metadata.get("ended_at_utc"), "state": "ready", "scan_mode": scan_mode, "pass_count": len(metadata.get("passes") or [])})
+                pass_count = len(metadata.get("passes") or [])
+                artifact_dir = self.artifacts / path.name
+                result.append({"session_id": metadata["session_id"], "frame_count": metadata["frame_count"], "total_bytes": size, "created_at": metadata.get("ended_at_utc"), "state": "ready", "scan_mode": scan_mode, "pass_count": pass_count, "object_tsdf_state": _object_tsdf_state(artifact_dir, pass_count) if scan_mode == "object" else None})
             except (OSError, KeyError, json.JSONDecodeError):
                 continue
         return result

@@ -88,6 +88,8 @@ async function loadSessions() {
           ['View Object Cloud', () => view(item.session_id, true)],
           ['Mask diagnostics', () => void showObjectDiagnostics(item.session_id)],
           ...(item.pass_count >= 2 ? [['Build Registered Object Cloud', () => start(item.session_id, 'registered_object_pointcloud')], ['View Registered', () => view(item.session_id, 'registered')]] : []),
+          ['Build Object Mesh (TSDF)', () => start(item.session_id, 'object_tsdf')],
+          ...(item.object_tsdf_state !== 'missing' ? [['View TSDF Mesh', () => view(item.session_id, 'tsdf')], ['TSDF diagnostics', () => void showTSDFDiagnostics(item.session_id, item.object_tsdf_state)]] : []),
         ] : []),
         ['Build point cloud', () => start(item.session_id, 'pointcloud')],
         ['Build mesh', () => start(item.session_id, 'mesh')],
@@ -141,9 +143,10 @@ async function poll(id, kind) {
   try {
     const state = await api(`/api/v2/sessions/${id}/job`);
     job.textContent = `${state.state.toUpperCase()} ${state.progress || 0}% — ${state.message || ''}`;
-    if (!['done', 'failed'].includes(state.state)) setTimeout(() => void poll(id), 1000);
+    if (!['done', 'failed'].includes(state.state)) setTimeout(() => void poll(id, kind), 1000);
     else if (state.state === 'done') {
       if (kind === 'object_pointcloud') void showObjectDiagnostics(id);
+      if (kind === 'object_tsdf') void showTSDFDiagnostics(id, 'current');
       void loadSessions();
     }
   } catch (error) {
@@ -155,7 +158,14 @@ let viewerModule;
 async function view(id, objectCloud) {
   try {
     viewerModule ||= await import('./viewer.js?v=2');
-    await viewerModule.viewSession(id, { headers, job, artifactNames: objectCloud === 'registered' ? ['object/object_registered_clean.ply'] : objectCloud ? ['object/object_clean.ply'] : undefined });
+    const artifactNames = objectCloud === 'tsdf'
+      ? ['object/reconstruction/tsdf/object_tsdf_clean.ply']
+      : objectCloud === 'registered'
+        ? ['object/object_registered_clean.ply']
+        : objectCloud
+          ? ['object/object_clean.ply']
+          : undefined;
+    await viewerModule.viewSession(id, { headers, job, artifactNames });
   } catch {
     job.textContent = '3D viewer unavailable';
   }
@@ -190,6 +200,29 @@ async function showObjectDiagnostics(id) {
       const warningText = document.createElement('p');
       warningText.textContent = `Warning: ${warning}`;
       objectDiagnostics.append(warningText);
+    }
+  } catch (error) {
+    objectDiagnostics.textContent = sessionErrorMessage(error);
+  }
+}
+
+async function showTSDFDiagnostics(id, state) {
+  clearObjectDiagnostics();
+  try {
+    const report = await api(`/api/v2/sessions/${id}/artifacts/object/reconstruction/tsdf/reconstruction.json`);
+    const mesh = report.mesh.clean;
+    const summary = document.createElement('p');
+    summary.textContent = `Object mesh — Backend: TSDF; Integrated: ${report.integrated_frames}/${report.input_frames}; Rejected: ${report.rejected_frames.length}; Vertices: ${mesh.vertices}; Triangles: ${mesh.triangles}; Processing: ${report.timings.total_seconds.toFixed(2)} s`;
+    objectDiagnostics.append(summary);
+    if (state === 'stale') {
+      const warning = document.createElement('p');
+      warning.textContent = 'STALE — object registration changed; rebuild the TSDF mesh.';
+      objectDiagnostics.append(warning);
+    }
+    for (const warningText of report.warnings || []) {
+      const warning = document.createElement('p');
+      warning.textContent = `Warning: ${warningText}`;
+      objectDiagnostics.append(warning);
     }
   } catch (error) {
     objectDiagnostics.textContent = sessionErrorMessage(error);

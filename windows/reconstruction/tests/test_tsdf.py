@@ -15,6 +15,7 @@ from tsdf import (
     TSDFPolicy,
     TSDFValidationError,
     conservative_clean_mesh,
+    conservative_clean_mesh_components,
     mesh_metrics,
     open3d_extrinsic_from_arkit_pose,
     write_mesh,
@@ -126,3 +127,14 @@ class TSDFTests(unittest.TestCase):
         self.assertGreater(len(loaded.vertices), 0)
         self.assertGreater(len(loaded.triangles), 0)
         self.assertTrue(np.all(np.isfinite(np.asarray(loaded.vertices))))
+
+    def test_component_cleanup_removes_only_tiny_island(self):
+        main = o3d.geometry.TriangleMesh.create_box(0.2, 0.2, 0.2)
+        island = o3d.geometry.TriangleMesh()
+        island.vertices = o3d.utility.Vector3dVector([[1, 0, 0], [1.1, 0, 0], [1, 0.1, 0]])
+        island.triangles = o3d.utility.Vector3iVector([[0, 1, 2]])
+        combined = main + island
+        clean, report = conservative_clean_mesh_components(combined, 2)
+        self.assertEqual(report["removed_components"], 1)
+        self.assertEqual(report["removed_triangles"], 1)
+        self.assertEqual(len(clean.triangles), len(main.triangles))

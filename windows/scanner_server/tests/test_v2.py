@@ -97,6 +97,33 @@ class V2ReceiverTests(unittest.TestCase):
         self.assertEqual(job_state["state"], "done", job_state)
         self.assertEqual(self.client.get("/api/v2/health", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/object_clean.ply", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.post("/api/v2/sessions/object/jobs", headers=self.headers, json={"kind": "object_tsdf", "device": "cpu"}).status_code, 200)
+        self.client.app.state.jobs.processes["object"].join(timeout=10)
+        tsdf_state = self.client.get("/api/v2/sessions/object/job", headers=self.headers).json()
+        self.assertEqual(tsdf_state["state"], "done", tsdf_state)
+        self.assertEqual(self.client.get("/api/v2/health", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/tsdf/object_tsdf_clean.ply", headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/tsdf/reconstruction.json", headers=self.headers).status_code, 200)
+        listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
+        self.assertEqual(listed["object_tsdf_state"], "current")
+
+    def test_changed_registration_marks_object_tsdf_stale(self) -> None:
+        session = self.root / "sessions" / "session_stale"
+        artifact = self.root / "artifacts" / "session_stale" / "object"
+        transform = artifact / "registration" / "pass_transforms.json"
+        report = artifact / "reconstruction" / "tsdf" / "reconstruction.json"
+        mesh = report.parent / "object_tsdf_clean.ply"
+        session.mkdir(parents=True); transform.parent.mkdir(parents=True); report.parent.mkdir(parents=True)
+        (session / "session.json").write_text(json.dumps({"session_id":"stale","frame_count":2,"scan_mode":"object","passes":[{"id":0},{"id":1}]}), encoding="utf-8")
+        transform.write_text('{"version":1}', encoding="utf-8")
+        digest = hashlib.sha256(transform.read_bytes()).hexdigest()
+        report.write_text(json.dumps({"registration":{"pass_transforms_sha256":digest}}), encoding="utf-8")
+        mesh.write_bytes(b"ply")
+        listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
+        self.assertEqual(listed["object_tsdf_state"], "current")
+        transform.write_text('{"version":2}', encoding="utf-8")
+        listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
+        self.assertEqual(listed["object_tsdf_state"], "stale")
 
     def test_object_job_rejects_scene_session(self) -> None:
         self.start(); self.assertEqual(self.upload(), 200)
@@ -132,7 +159,10 @@ class V2ReceiverTests(unittest.TestCase):
         self.assertIn("No verified sessions", app_js.text)
         self.assertIn("Authentication required", app_js.text)
         self.assertIn("Cannot reach receiver", app_js.text)
+        self.assertIn("Build Object Mesh (TSDF)", app_js.text)
+        self.assertIn("STALE", app_js.text)
         self.assertEqual(self.client.get("/viewer.js").status_code, 200)
+        self.assertIn("geometry.index !== null", self.client.get("/viewer.js").text)
         self.assertEqual(self.client.get("/vendor/three/three.module.js").status_code, 200)
         self.assertEqual(self.client.get("/vendor/three/addons/controls/OrbitControls.js").status_code, 200)
         self.assertEqual(self.client.get("/vendor/three/addons/loaders/PLYLoader.js").status_code, 200)

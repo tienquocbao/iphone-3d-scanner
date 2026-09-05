@@ -22,7 +22,18 @@ FPFH/RANSAC, refined with point-to-plane ICP, and rejected unless configured
 fitness/RMSE thresholds pass. Accepted `object_from_pass` transforms are stored
 separately from immutable per-frame `world_from_camera` poses.
 
+## Gate C1 — deterministic object-relative TSDF mesh
+
+Gate C1 reuses the original masked RGB-D observations rather than meshing the
+registered point cloud. For every frame it composes
+`object_from_camera = object_from_pass @ pass_world_from_camera`, applies the
+existing ARKit-to-CV convention, and integrates into a CPU Open3D scalable TSDF
+volume. The registered cloud supplies only a conservatively expanded safety
+bound. Raw and conservatively cleaned colored PLY meshes are retained, and the
+reconstruction records the SHA-256 of the Gate B transform artifact so stale
+meshes are visible after registration changes.
+
 ## Later gates
 
-- Gate C: object TSDF/NKSR and reconstruction comparison.
+- Gate C2: NKSR neural surface reconstruction and comparison with Gate C1.
 - Gate D: hand robustness, mesh cleanup, texture, and production exports.

@@ -74,21 +74,37 @@ def open3d_extrinsic_from_arkit_pose(world_from_arkit: np.ndarray) -> np.ndarray
     return extrinsic
 
 
-def _depth_mask(frame: FrameData, policy: TSDFPolicy) -> np.ndarray:
+def _depth_mask(
+    frame: FrameData,
+    policy: TSDFPolicy,
+    additional_mask: np.ndarray | None = None,
+) -> np.ndarray:
     depth = frame.depth
     valid = np.isfinite(depth) & (depth > 0) & (frame.confidence >= policy.min_confidence)
     if policy.min_depth is not None:
         valid &= depth >= policy.min_depth
     if policy.max_depth is not None:
         valid &= depth <= policy.max_depth
+    if additional_mask is not None:
+        mask = np.asarray(additional_mask, dtype=bool)
+        if mask.shape != depth.shape:
+            raise TSDFValidationError(
+                f"additional depth mask shape {mask.shape} does not match depth {depth.shape}"
+            )
+        valid &= mask
     return valid
 
 
-def prepare_tsdf_frame(frame: FrameData, policy: TSDFPolicy) -> PreparedTSDFFrame:
+def prepare_tsdf_frame(
+    frame: FrameData,
+    policy: TSDFPolicy,
+    additional_depth_mask: np.ndarray | None = None,
+    world_from_arkit: np.ndarray | None = None,
+) -> PreparedTSDFFrame:
     """Create depth-sized RGB-D data and the correctly directed extrinsic."""
 
     policy.validate()
-    valid = _depth_mask(frame, policy)
+    valid = _depth_mask(frame, policy, additional_depth_mask)
     depth = np.where(valid, frame.depth, 0.0).astype(np.float32, copy=False)
     height, width = depth.shape
     v, u = np.indices((height, width), dtype=np.int32)
@@ -110,7 +126,9 @@ def prepare_tsdf_frame(frame: FrameData, policy: TSDFPolicy) -> PreparedTSDFFram
     return PreparedTSDFFrame(
         rgbd=rgbd,
         intrinsic=intrinsic,
-        extrinsic=open3d_extrinsic_from_arkit_pose(frame.world_from_camera),
+        extrinsic=open3d_extrinsic_from_arkit_pose(
+            frame.world_from_camera if world_from_arkit is None else world_from_arkit
+        ),
         valid_samples=int(np.count_nonzero(valid)),
         total_samples=int(depth.size),
         min_depth=float(np.min(values)) if len(values) else None,
@@ -176,6 +194,34 @@ def conservative_clean_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.Tri
     cleaned.compute_vertex_normals()
     validate_mesh(cleaned)
     return cleaned
+
+
+def conservative_clean_mesh_components(
+    mesh: o3d.geometry.TriangleMesh,
+    minimum_component_triangles: int,
+) -> tuple[o3d.geometry.TriangleMesh, dict[str, object]]:
+    """Apply topology cleanup and remove only components below a configured size."""
+
+    if minimum_component_triangles < 1:
+        raise TSDFValidationError("minimum_component_triangles must be positive")
+    cleaned = conservative_clean_mesh(mesh)
+    labels, counts, _ = cleaned.cluster_connected_triangles()
+    component_sizes = np.asarray(counts, dtype=np.int64)
+    labels_array = np.asarray(labels, dtype=np.int64)
+    remove = component_sizes[labels_array] < minimum_component_triangles
+    removed_triangles = int(np.count_nonzero(remove))
+    removed_components = int(np.count_nonzero(component_sizes < minimum_component_triangles))
+    if removed_triangles:
+        cleaned.remove_triangles_by_mask(remove)
+        cleaned.remove_unreferenced_vertices()
+        cleaned.compute_vertex_normals()
+    validate_mesh(cleaned)
+    return cleaned, {
+        "component_count": int(len(component_sizes)),
+        "component_triangle_counts": component_sizes.tolist(),
+        "removed_components": removed_components,
+        "removed_triangles": removed_triangles,
+    }
 
 
 def write_mesh(path: Path, mesh: o3d.geometry.TriangleMesh) -> int:

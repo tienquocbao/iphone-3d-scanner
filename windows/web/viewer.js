@@ -53,7 +53,8 @@ export async function viewSession(id, { headers, job, artifactNames = ['pointclo
   }
   const geometry = new PLYLoader().parse(await response.arrayBuffer());
   geometry.computeBoundingSphere();
-  const mesh = selectedName.includes('mesh_');
+  const mesh = geometry.index !== null;
+  if (mesh && !geometry.hasAttribute('normal')) geometry.computeVertexNormals();
   const material = mesh
     ? new THREE.MeshStandardMaterial({ vertexColors: geometry.hasAttribute('color'), color: 0x78aaff, side: THREE.DoubleSide })
     : geometry.hasAttribute('color')

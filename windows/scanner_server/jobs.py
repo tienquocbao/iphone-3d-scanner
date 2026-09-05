@@ -86,6 +86,27 @@ def _worker(session_dir: str, artifact_dir: str, kind: str, device: str) -> None
             def progress(value, message, metrics=None): _write(job_path, {"state":"running","kind":kind,"progress":value,"message":message,"device":"cpu","started_at":started, **({"metrics":metrics} if metrics else {})})
             metrics = build_registered_object_cloud(Path(session_dir), Path(artifact_dir), progress=progress)
             _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":"cpu","metrics":metrics,"finished_at":time.time()})
+        elif kind == "object_tsdf":
+            from object_tsdf import build_object_tsdf
+
+            def progress(value, message, metrics=None):
+                _write(
+                    job_path,
+                    {
+                        "state": "running",
+                        "kind": kind,
+                        "progress": value,
+                        "message": message,
+                        "device": "cpu",
+                        "started_at": started,
+                        **({"metrics": metrics} if metrics else {}),
+                    },
+                )
+
+            metrics = build_object_tsdf(
+                Path(session_dir), Path(artifact_dir), progress=progress
+            )
+            _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":"cpu","metrics":metrics,"finished_at":time.time()})
         elif kind == "mesh":
             from reconstruct_tsdf import main as tsdf_main
 
@@ -107,12 +128,12 @@ class JobManager:
         self.processes: dict[str, mp.Process] = {}
 
     def start(self, session_id: str, kind: str, device: str = "auto") -> dict[str, object]:
-        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud"}:
+        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud", "object_tsdf"}:
             raise ValueError("unsupported job kind")
         session_dir = self.sessions_root / f"session_{session_id}"
         if not session_dir.is_dir():
             raise ValueError("verified session does not exist")
-        if kind in {"object_pointcloud", "registered_object_pointcloud"}:
+        if kind in {"object_pointcloud", "registered_object_pointcloud", "object_tsdf"}:
             try:
                 metadata = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
