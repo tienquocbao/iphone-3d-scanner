@@ -1,6 +1,7 @@
 """Classical multi-pass object registration into pass 0's canonical coordinates."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass
+import time
 import numpy as np
 import open3d as o3d
 
@@ -40,19 +41,22 @@ def _angle(matrix: np.ndarray) -> float:
 
 def register_pass(source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud, config: ObjectRegistrationConfig = ObjectRegistrationConfig(), initial_transform: np.ndarray | None = None) -> dict[str, object]:
     """Return object_from_pass (source-to-target), diagnostics, and accepted status."""
-    config.validate(); o3d.utility.random.seed(7)
+    config.validate(); o3d.utility.random.seed(7); prepared_at = time.perf_counter()
     source_down, source_feature = _prepare(source, config); target_down, target_feature = _prepare(target, config)
+    features_seconds = time.perf_counter() - prepared_at
     distance = config.registration_voxel_size * config.ransac_distance_multiplier
+    global_started = time.perf_counter()
     global_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
         source_down, target_down, source_feature, target_feature, True, distance,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 4,
         [o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance)],
         o3d.pipelines.registration.RANSACConvergenceCriteria(config.max_iterations, 0.999),
     )
+    global_seconds = time.perf_counter() - global_started
     seed = np.asarray(initial_transform, dtype=np.float64) if initial_transform is not None else global_result.transformation
     source_fine = o3d.geometry.PointCloud(source); target_fine = o3d.geometry.PointCloud(target)
     source_fine.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=config.registration_voxel_size * config.normal_radius_multiplier, max_nn=30))
     target_fine.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=config.registration_voxel_size * config.normal_radius_multiplier, max_nn=30))
-    fine = o3d.pipelines.registration.registration_icp(source_fine, target_fine, config.registration_voxel_size * config.icp_distance_multiplier, seed, o3d.pipelines.registration.TransformationEstimationPointToPlane())
+    icp_started = time.perf_counter(); fine = o3d.pipelines.registration.registration_icp(source_fine, target_fine, config.registration_voxel_size * config.icp_distance_multiplier, seed, o3d.pipelines.registration.TransformationEstimationPointToPlane()); icp_seconds = time.perf_counter() - icp_started
     accepted = bool(global_result.fitness >= config.min_global_fitness and fine.fitness >= config.min_icp_fitness and fine.inlier_rmse <= config.max_icp_rmse)
-    return {"object_from_pass": fine.transformation.tolist(), "global_fitness": float(global_result.fitness), "global_rmse": float(global_result.inlier_rmse), "icp_fitness": float(fine.fitness), "icp_rmse": float(fine.inlier_rmse), "translation_meters": float(np.linalg.norm(fine.transformation[:3,3])), "rotation_degrees": _angle(fine.transformation), "accepted": accepted, "policy": asdict(config)}
+    return {"object_from_pass": fine.transformation.tolist(), "global_fitness": float(global_result.fitness), "global_rmse": float(global_result.inlier_rmse), "icp_fitness": float(fine.fitness), "icp_rmse": float(fine.inlier_rmse), "translation_meters": float(np.linalg.norm(fine.transformation[:3,3])), "rotation_degrees": _angle(fine.transformation), "accepted": accepted, "timing_seconds":{"features":features_seconds,"global":global_seconds,"icp":icp_seconds}, "policy": asdict(config)}
