@@ -22,6 +22,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var isTransferring = false
     @Published var uploadProgressText = ""
     @Published var selectedScanMode: ScanMode = .scene
+    @Published var objectScanState: ObjectScanState = .idle
 
     private let captureService = FrameCaptureService()
     private lazy var transferService = SessionTransferService(captureService: captureService)
@@ -37,6 +38,8 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     private var sessionStartedAt = Date()
     private var writePending = false
     private var recordingScanMode: ScanMode = .scene
+    private var completedObjectPasses: [ScanPassMetadata] = []
+    private var activePassStartFrame: Int?
 
     override init() {
         super.init()
@@ -180,6 +183,23 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func startScan() {
+        if selectedScanMode == .object {
+            startObjectPass()
+            return
+        }
+        startNewSession(scanMode: .scene)
+    }
+
+    func startObjectPass() {
+        if case .betweenPasses = objectScanState {
+            resumeObjectPass()
+            return
+        }
+        guard objectScanState == .idle else { return }
+        startNewSession(scanMode: .object)
+    }
+
+    private func startNewSession(scanMode: ScanMode) {
         captureStateLock.lock()
         let alreadyRecording = recording
         captureStateLock.unlock()
@@ -207,7 +227,7 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             sessionID: newSessionID,
             startedAt: startDate,
             policy: recordingPolicy,
-            scanMode: selectedScanMode
+                scanMode: scanMode
             )
         } catch {
             reportScanError("Cannot create session: \(error.localizedDescription)")
@@ -223,7 +243,9 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
         nextFrameIndex = 0
         sessionBytes = 0
         sessionStartedAt = startDate
-        recordingScanMode = selectedScanMode
+        recordingScanMode = scanMode
+        completedObjectPasses = []
+        activePassStartFrame = scanMode == .object ? 0 : nil
         writePending = false
         keyframeSelector.reset()
         recording = true
@@ -236,11 +258,64 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             self.durationText = "00:00"
             self.storageText = "0 B"
             self.captureStatus = "Recording synchronized RGB-D frames..."
+            self.objectScanState = scanMode == .object ? .recordingPass(id: 0) : .idle
         }
 
     }
 
+    private func resumeObjectPass() {
+        captureStateLock.lock()
+        guard !recording, recordingScanMode == .object else { captureStateLock.unlock(); return }
+        activePassStartFrame = nextFrameIndex
+        recording = true
+        keyframeSelector.reset()
+        let passID = completedObjectPasses.count
+        captureStateLock.unlock()
+        UIApplication.shared.isIdleTimerDisabled = true
+        scanState = .recording
+        objectScanState = .recordingPass(id: passID)
+        captureStatus = "Recording pass \(passID + 1)"
+    }
+
+    func finishObjectPass() {
+        captureStateLock.lock()
+        guard recording, recordingScanMode == .object, let start = activePassStartFrame else { captureStateLock.unlock(); return }
+        recording = false
+        let passID = completedObjectPasses.count
+        let currentSessionID = sessionID
+        captureStateLock.unlock()
+        UIApplication.shared.isIdleTimerDisabled = false
+        scanState = .finalizing
+        captureStatus = "Finishing pass \(passID + 1)..."
+        captureQueue.async {
+            let end = self.successfulFrameCount - 1
+            guard end >= start else {
+                self.reportScanError("Pass \(passID + 1) captured no frames")
+                return
+            }
+            let pass = ScanPassMetadata(id: passID, startFrame: start, endFrame: end)
+            self.captureStateLock.lock(); self.completedObjectPasses.append(pass); self.activePassStartFrame = nil; let passes = self.completedObjectPasses; self.captureStateLock.unlock()
+            do {
+                try self.captureService.updateRecordingPasses(sessionID: currentSessionID, passes: passes)
+                DispatchQueue.main.async {
+                    self.scanState = .betweenPasses
+                    self.objectScanState = .betweenPasses(completedPasses: passes.count)
+                    self.captureStatus = "Pass \(passID + 1) complete. Reposition the object, then remove hands."
+                }
+            } catch { self.reportScanError("Could not save pass metadata: \(error.localizedDescription)") }
+        }
+    }
+
+    func finishObjectScan() {
+        guard case .betweenPasses = objectScanState else { return }
+        finalizeCurrentSession(message: "Finalizing object scan...")
+    }
+
     func stopScan() {
+        if recordingScanMode == .object {
+            finishObjectPass()
+            return
+        }
         stopScan(message: "Finalizing session...")
     }
 
@@ -251,10 +326,14 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
         recording = false
-        let finishingSessionID = sessionID
-        let finishingStartedAt = sessionStartedAt
         captureStateLock.unlock()
 
+        finalizeCurrentSession(message: message)
+    }
+
+    private func finalizeCurrentSession(message: String) {
+        let finishingSessionID = sessionID
+        let finishingStartedAt = sessionStartedAt
         DispatchQueue.main.async {
             UIApplication.shared.isIdleTimerDisabled = false
             self.scanState = .finalizing
@@ -269,12 +348,14 @@ final class ARSessionManager: NSObject, ObservableObject, ARSessionDelegate {
                         frameCount: self.successfulFrameCount,
                         totalBytes: self.sessionBytes,
                         startedAt: finishingStartedAt,
-                        scanMode: self.recordingScanMode
+                        scanMode: self.recordingScanMode,
+                        passes: self.recordingScanMode == .object ? self.completedObjectPasses : nil
                     )
                     DispatchQueue.main.async {
                         self.scanState = .completed
                         self.capturedFrameCount = result.frameCount
                         self.captureStatus = "Session complete locally in \(String(format: "%.2f", Date().timeIntervalSince(finalizedAt))) s: \(result.frameCount) frames validated"
+                        self.objectScanState = .idle
                     }
             } catch {
                     DispatchQueue.main.async {

@@ -185,7 +185,7 @@ class TransferStore:
                 scan_mode = metadata.get("scan_mode", "scene")
                 if scan_mode not in {"scene", "object"}:
                     scan_mode = "scene"
-                result.append({"session_id": metadata["session_id"], "frame_count": metadata["frame_count"], "total_bytes": size, "created_at": metadata.get("ended_at_utc"), "state": "ready", "scan_mode": scan_mode})
+                result.append({"session_id": metadata["session_id"], "frame_count": metadata["frame_count"], "total_bytes": size, "created_at": metadata.get("ended_at_utc"), "state": "ready", "scan_mode": scan_mode, "pass_count": len(metadata.get("passes") or [])})
             except (OSError, KeyError, json.JSONDecodeError):
                 continue
         return result

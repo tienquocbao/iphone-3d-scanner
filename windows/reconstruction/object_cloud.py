@@ -52,7 +52,7 @@ def _masked_points(frame: FrameData, mask: np.ndarray, config: ObjectCloudConfig
     return points[keep], sample_rgb(frame, kept_pixels), before_mask, int(np.count_nonzero(keep))
 
 
-def build_object_cloud(session_dir: Path, artifact_dir: Path, config: ObjectCloudConfig = ObjectCloudConfig(), progress=None) -> dict[str, object]:
+def build_object_cloud(session_dir: Path, artifact_dir: Path, config: ObjectCloudConfig = ObjectCloudConfig(), progress=None, selected_frame_dirs=None, output_dir: Path | None = None, mask_dir: Path | None = None, raw_name: str = "object_raw.ply", clean_name: str = "object_clean.ply") -> dict[str, object]:
     """Build object-only raw/clean clouds without changing immutable raw sessions."""
 
     config.validate()
@@ -61,13 +61,14 @@ def build_object_cloud(session_dir: Path, artifact_dir: Path, config: ObjectClou
     metadata = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
     if metadata.get("scan_mode") != "object":
         raise SessionValidationError("Build Object Point Cloud requires scan_mode=object")
-    frame_dirs = session_frame_dirs(session_dir)
+    frame_dirs = tuple(selected_frame_dirs) if selected_frame_dirs is not None else session_frame_dirs(session_dir)
     if progress:
         progress(10, "CALIBRATING BACKGROUND")
     calibration_started = time.perf_counter()
     model = calibrate_green_background((load_frame(directory).rgb for directory in frame_dirs), config.foreground)
     calibration_seconds = time.perf_counter() - calibration_started
-    object_dir, masks_dir = artifact_dir / "object", artifact_dir / "object" / "masks"
+    object_dir = Path(output_dir) if output_dir is not None else artifact_dir / "object"
+    masks_dir = Path(mask_dir) if mask_dir is not None else artifact_dir / "object" / "masks"
     masks_dir.mkdir(parents=True, exist_ok=True)
     all_points: list[np.ndarray] = []
     all_colors: list[np.ndarray] = []
@@ -103,7 +104,7 @@ def build_object_cloud(session_dir: Path, artifact_dir: Path, config: ObjectClou
     if progress:
         progress(60, "BACKPROJECTING")
     raw = _cloud(np.concatenate(all_points), np.concatenate(all_colors))
-    raw_path = object_dir / "object_raw.ply"
+    raw_path = object_dir / raw_name
     write_cloud(raw_path, raw)
     if progress:
         progress(75, "FILTERING")
@@ -120,7 +121,7 @@ def build_object_cloud(session_dir: Path, artifact_dir: Path, config: ObjectClou
     filtering_seconds = time.perf_counter() - filtering_started
     if progress:
         progress(90, "EXPORTING")
-    clean_path = object_dir / "object_clean.ply"
+    clean_path = object_dir / clean_name
     write_cloud(clean_path, clean)
     warnings: list[str] = []
     ratio_array = np.asarray(foreground_ratios)
@@ -141,7 +142,7 @@ def build_object_cloud(session_dir: Path, artifact_dir: Path, config: ObjectClou
         "warnings": warnings,
         "timing_seconds": {"calibration": calibration_seconds, "masking": mask_seconds, "backprojection": backprojection_seconds, "filtering_export": filtering_seconds, "total": time.perf_counter() - started},
         "config": {**asdict(config), "foreground": asdict(config.foreground)},
-        "outputs": {"raw": "object/object_raw.ply", "clean": "object/object_clean.ply", "masks": "object/masks", "diagnostic_masks": diagnostic_masks},
+        "outputs": {"raw": str(raw_path.relative_to(artifact_dir)).replace("\\", "/"), "clean": str(clean_path.relative_to(artifact_dir)).replace("\\", "/"), "masks": str(masks_dir.relative_to(artifact_dir)).replace("\\", "/"), "diagnostic_masks": diagnostic_masks},
     }
     _write_json(object_dir / "processing.json", processing)
     if progress:

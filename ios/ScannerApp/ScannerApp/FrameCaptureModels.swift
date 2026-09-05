@@ -6,6 +6,13 @@ enum ScanState: String {
     case finalizing = "FINALIZING"
     case completed = "COMPLETED"
     case error = "ERROR"
+    case betweenPasses = "BETWEEN PASSES"
+}
+
+enum ObjectScanState: Equatable {
+    case idle
+    case recordingPass(id: Int)
+    case betweenPasses(completedPasses: Int)
 }
 
 enum ScanMode: String, Codable, CaseIterable, Identifiable {

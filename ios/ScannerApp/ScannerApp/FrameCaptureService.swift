@@ -228,7 +228,8 @@ final class FrameCaptureService {
         frameCount: Int,
         totalBytes: Int64,
         startedAt: Date,
-        scanMode: ScanMode
+        scanMode: ScanMode,
+        passes: [ScanPassMetadata]? = nil
     ) throws -> SessionFinalizationResult {
         let sessionDirectory = try sessionDirectory(for: sessionID)
         let framesDirectory = sessionDirectory.appendingPathComponent(
@@ -268,9 +269,9 @@ final class FrameCaptureService {
                 message: "All frame files and metadata validated"
             ),
             scanMode: scanMode,
-            passes: scanMode == .object && frameCount > 0
+            passes: passes ?? (scanMode == .object && frameCount > 0
                 ? [ScanPassMetadata(id: 0, startFrame: 0, endFrame: frameCount - 1)]
-                : nil
+                : nil)
         )
         let sessionData = try JSONEncoder().encodedSessionMetadata(metadata)
         try sessionData.write(
@@ -283,6 +284,22 @@ final class FrameCaptureService {
             frameCount: frameCount,
             directory: sessionDirectory
         )
+    }
+
+    func updateRecordingPasses(sessionID: String, passes: [ScanPassMetadata]) throws {
+        let directory = try sessionDirectory(for: sessionID)
+        let path = directory.appendingPathComponent("session.json")
+        let current = try JSONDecoder().decode(SessionMetadata.self, from: Data(contentsOf: path))
+        let updated = SessionMetadata(
+            schemaVersion: current.schemaVersion, sessionID: current.sessionID,
+            status: current.status, startedAtUTC: current.startedAtUTC,
+            endedAtUTC: current.endedAtUTC, durationSeconds: current.durationSeconds,
+            frameCount: current.frameCount, totalBytes: current.totalBytes,
+            captureMode: current.captureMode, recordingPolicy: current.recordingPolicy,
+            sensor: current.sensor, validation: current.validation,
+            scanMode: current.scanMode, passes: passes
+        )
+        try JSONEncoder().encodedSessionMetadata(updated).write(to: path, options: .atomic)
     }
 
     func deleteSession(sessionID: String) throws {

@@ -87,6 +87,7 @@ async function loadSessions() {
           ['Build Object Point Cloud', () => start(item.session_id, 'object_pointcloud')],
           ['View Object Cloud', () => view(item.session_id, true)],
           ['Mask diagnostics', () => void showObjectDiagnostics(item.session_id)],
+          ...(item.pass_count >= 2 ? [['Build Registered Object Cloud', () => start(item.session_id, 'registered_object_pointcloud')], ['View Registered', () => view(item.session_id, 'registered')]] : []),
         ] : []),
         ['Build point cloud', () => start(item.session_id, 'pointcloud')],
         ['Build mesh', () => start(item.session_id, 'mesh')],
@@ -154,7 +155,7 @@ let viewerModule;
 async function view(id, objectCloud) {
   try {
     viewerModule ||= await import('./viewer.js?v=2');
-    await viewerModule.viewSession(id, { headers, job, artifactNames: objectCloud ? ['object/object_clean.ply'] : undefined });
+    await viewerModule.viewSession(id, { headers, job, artifactNames: objectCloud === 'registered' ? ['object/object_registered_clean.ply'] : objectCloud ? ['object/object_clean.ply'] : undefined });
   } catch {
     job.textContent = '3D viewer unavailable';
   }

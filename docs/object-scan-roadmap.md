@@ -13,8 +13,16 @@ diagnostics, invalidates background depth before backprojection, and exports
 not register flipped passes or create meshes. Green object regions can be
 mistaken for background and are reported as a warning.
 
+## Gate B — multi-pass registered point cloud
+
+Object passes have explicit, contiguous global frame ranges. Each pass is
+foreground-processed independently in its own ARKit pass-world frame. Pass 0
+is initially canonical. Later clean clouds are globally registered with
+FPFH/RANSAC, refined with point-to-plane ICP, and rejected unless configured
+fitness/RMSE thresholds pass. Accepted `object_from_pass` transforms are stored
+separately from immutable per-frame `world_from_camera` poses.
+
 ## Later gates
 
-- Gate B: explicit passes, object repositioning, FPFH/RANSAC and ICP/GICP.
 - Gate C: object TSDF/NKSR and reconstruction comparison.
 - Gate D: hand robustness, mesh cleanup, texture, and production exports.

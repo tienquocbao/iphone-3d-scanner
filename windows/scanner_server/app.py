@@ -34,7 +34,7 @@ class FinalizePayload(BaseModel):
 
 
 class JobPayload(BaseModel):
-    kind: Literal["pointcloud", "mesh", "object_pointcloud"]
+    kind: Literal["pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud"]
     device: Literal["auto", "cpu", "cuda"] = "auto"
 
 
@@ -131,9 +131,10 @@ def create_app(storage_root: Path, bearer_token: str = "") -> FastAPI:
 
     @app.get("/api/v2/sessions/{session_id}/artifacts/{name:path}")
     def artifact(session_id: str, name: str, _: None = Depends(authorize)) -> FileResponse:
-        allowed = {"pointcloud.ply", "mesh_mesh_clean.ply", "mesh_mesh_raw.ply", "mesh_tsdf_pointcloud.ply", "job.json", "object/object_raw.ply", "object/object_clean.ply", "object/processing.json"}
-        valid_mask = bool(re.fullmatch(r"object/masks/[0-9]{6}\.png", name))
-        if name not in allowed and not valid_mask:
+        allowed = {"pointcloud.ply", "mesh_mesh_clean.ply", "mesh_mesh_raw.ply", "mesh_tsdf_pointcloud.ply", "job.json", "object/object_raw.ply", "object/object_clean.ply", "object/object_registered_raw.ply", "object/object_registered_clean.ply", "object/processing.json", "object/registration/pass_transforms.json", "object/registration/registration.json"}
+        valid_mask = bool(re.fullmatch(r"object/masks/(?:pass_[0-9]{3}/)?[0-9]{6}\.png", name))
+        valid_pass = bool(re.fullmatch(r"object/passes/pass_[0-9]{3}_(?:raw|clean)\.ply", name))
+        if name not in allowed and not valid_mask and not valid_pass:
             raise HTTPException(404, "artifact not found")
         path = store.artifacts / f"session_{session_id}" / name
         if not path.is_file():

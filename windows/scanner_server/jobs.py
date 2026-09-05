@@ -81,6 +81,11 @@ def _worker(session_dir: str, artifact_dir: str, kind: str, device: str) -> None
 
             metrics = build_object_cloud(Path(session_dir), Path(artifact_dir), progress=progress)
             _write(job_path, {"state": "done", "kind": kind, "progress": 100, "message": "DONE", "device": "cpu", "metrics": metrics, "finished_at": time.time()})
+        elif kind == "registered_object_pointcloud":
+            from multipass_object import build_registered_object_cloud
+            def progress(value, message, metrics=None): _write(job_path, {"state":"running","kind":kind,"progress":value,"message":message,"device":"cpu","started_at":started, **({"metrics":metrics} if metrics else {})})
+            metrics = build_registered_object_cloud(Path(session_dir), Path(artifact_dir), progress=progress)
+            _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":"cpu","metrics":metrics,"finished_at":time.time()})
         elif kind == "mesh":
             from reconstruct_tsdf import main as tsdf_main
 
@@ -102,18 +107,20 @@ class JobManager:
         self.processes: dict[str, mp.Process] = {}
 
     def start(self, session_id: str, kind: str, device: str = "auto") -> dict[str, object]:
-        if kind not in {"pointcloud", "mesh", "object_pointcloud"}:
+        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud"}:
             raise ValueError("unsupported job kind")
         session_dir = self.sessions_root / f"session_{session_id}"
         if not session_dir.is_dir():
             raise ValueError("verified session does not exist")
-        if kind == "object_pointcloud":
+        if kind in {"object_pointcloud", "registered_object_pointcloud"}:
             try:
                 metadata = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise ValueError("verified session has invalid session.json") from exc
             if metadata.get("scan_mode") != "object":
                 raise ValueError("Build Object Point Cloud requires an Object Scan session")
+            if kind == "registered_object_pointcloud" and len(metadata.get("passes") or []) < 2:
+                raise ValueError("Registered Object Cloud requires at least two completed passes")
         artifact_dir = self.artifacts_root / f"session_{session_id}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         active = self.processes.get(session_id)

@@ -35,10 +35,23 @@ struct ContentView: View {
                         .font(.caption.monospaced())
                     }
 
-                    if manager.scanState == .recording {
-                        Button("Stop Scan") {
-                            manager.stopScan()
+                    if case .recordingPass(let passID) = manager.objectScanState {
+                        Text("Pass \(passID + 1)")
+                            .font(.headline)
+                        Button("Finish Pass") { manager.finishObjectPass() }
+                            .buttonStyle(.borderedProminent)
+                    } else if case .betweenPasses(let passCount) = manager.objectScanState {
+                        Text("Pass \(passCount) completed. Reposition / flip the object. Keep overlap visible; remove hands before continuing.")
+                            .font(.footnote)
+                            .multilineTextAlignment(.center)
+                        HStack {
+                            Button("Start Next Pass") { manager.startObjectPass() }
+                                .buttonStyle(.bordered)
+                            Button("Finish Object Scan") { manager.finishObjectScan() }
+                                .buttonStyle(.borderedProminent)
                         }
+                    } else if manager.scanState == .recording {
+                        Button("Stop Scan") { manager.stopScan() }
                         .buttonStyle(.borderedProminent)
                     } else if manager.scanState == .finalizing {
                         ProgressView("Finalizing...")
@@ -80,9 +93,7 @@ struct ContentView: View {
                             }
                         }
                         .pickerStyle(.segmented)
-                        Button("Start Scan") {
-                            manager.startScan()
-                        }
+                        Button(manager.selectedScanMode == .object ? "Start Pass" : "Start Scan") { manager.startScan() }
                         .buttonStyle(.borderedProminent)
                     }
 
