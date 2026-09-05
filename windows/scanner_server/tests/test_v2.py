@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import numpy as np
@@ -13,6 +16,7 @@ import open3d as o3d
 
 from windows.scanner_server.app import create_app
 from windows.scanner_server.storage import MAGIC
+from windows.scanner_server.jobs import nksr_diagnostics
 
 
 class V2ReceiverTests(unittest.TestCase):
@@ -106,6 +110,31 @@ class V2ReceiverTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/tsdf/reconstruction.json", headers=self.headers).status_code, 200)
         listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
         self.assertEqual(listed["object_tsdf_state"], "current")
+        diagnostics = self.client.get("/api/v2/diagnostics", headers=self.headers).json()
+        self.assertIn("nksr", diagnostics)
+        self.assertFalse(diagnostics["nksr"]["available"])
+        unavailable = self.client.post("/api/v2/sessions/object/jobs", headers=self.headers, json={"kind": "object_nksr", "device": "auto"})
+        self.assertEqual(unavailable.status_code, 400)
+        self.assertIn("NKSR unavailable", unavailable.text)
+        fake_runner = Path(__file__).parents[2] / "reconstruction" / "tests" / "fake_nksr_runner.py"
+        with patch.dict(os.environ, {"IPHONE3D_NKSR_PYTHON":sys.executable, "IPHONE3D_NKSR_RUNNER":str(fake_runner)}):
+            nksr_diagnostics.cache_clear()
+            self.assertEqual(self.client.post("/api/v2/sessions/object/jobs", headers=self.headers, json={"kind":"object_nksr","device":"auto"}).status_code, 200)
+            self.client.app.state.jobs.processes["object"].join(timeout=15)
+            nksr_state = self.client.get("/api/v2/sessions/object/job", headers=self.headers).json()
+            self.assertEqual(nksr_state["state"], "done", nksr_state)
+            self.assertEqual(self.client.get("/api/v2/health", headers=self.headers).status_code, 200)
+            self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/nksr/object_nksr_clean.ply", headers=self.headers).status_code, 200)
+            os.environ["IPHONE3D_FAKE_NKSR_MODE"] = "failure"
+            self.assertEqual(self.client.post("/api/v2/sessions/object/jobs", headers=self.headers, json={"kind":"object_nksr","device":"auto"}).status_code, 200)
+            self.client.app.state.jobs.processes["object"].join(timeout=15)
+            failed_state = self.client.get("/api/v2/sessions/object/job", headers=self.headers).json()
+            self.assertEqual(failed_state["state"], "failed", failed_state)
+            self.assertIn("deliberate adapter failure", failed_state["message"])
+            self.assertEqual(self.client.get("/api/v2/health", headers=self.headers).status_code, 200)
+            self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/tsdf/object_tsdf_clean.ply", headers=self.headers).status_code, 200)
+            self.assertEqual(self.client.get("/api/v2/sessions/object/artifacts/object/reconstruction/nksr/object_nksr_clean.ply", headers=self.headers).status_code, 200)
+        nksr_diagnostics.cache_clear()
 
     def test_changed_registration_marks_object_tsdf_stale(self) -> None:
         session = self.root / "sessions" / "session_stale"
@@ -124,6 +153,23 @@ class V2ReceiverTests(unittest.TestCase):
         transform.write_text('{"version":2}', encoding="utf-8")
         listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
         self.assertEqual(listed["object_tsdf_state"], "stale")
+
+    def test_nksr_artifact_provenance_becomes_stale_with_registration(self) -> None:
+        session = self.root / "sessions" / "session_nksr"
+        artifact = self.root / "artifacts" / "session_nksr" / "object"
+        transform = artifact / "registration" / "pass_transforms.json"
+        report = artifact / "reconstruction" / "nksr" / "reconstruction.json"
+        mesh = report.parent / "object_nksr_clean.ply"
+        session.mkdir(parents=True); transform.parent.mkdir(parents=True); report.parent.mkdir(parents=True)
+        (session / "session.json").write_text(json.dumps({"session_id":"nksr","frame_count":2,"scan_mode":"object","passes":[{"id":0},{"id":1}]}), encoding="utf-8")
+        transform.write_text('{"version":1}', encoding="utf-8")
+        digest = hashlib.sha256(transform.read_bytes()).hexdigest()
+        report.write_text(json.dumps({"pass_transforms_sha256":digest}), encoding="utf-8"); mesh.write_bytes(b"ply")
+        listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
+        self.assertEqual(listed["object_nksr_state"], "current")
+        transform.write_text('{"version":2}', encoding="utf-8")
+        listed = self.client.get("/api/v2/sessions", headers=self.headers).json()["sessions"][0]
+        self.assertEqual(listed["object_nksr_state"], "stale")
 
     def test_object_job_rejects_scene_session(self) -> None:
         self.start(); self.assertEqual(self.upload(), 200)
@@ -161,6 +207,8 @@ class V2ReceiverTests(unittest.TestCase):
         self.assertIn("Cannot reach receiver", app_js.text)
         self.assertIn("Build Object Mesh (TSDF)", app_js.text)
         self.assertIn("STALE", app_js.text)
+        self.assertIn("NKSR unavailable", app_js.text)
+        self.assertIn("Build Object Mesh (NKSR)", app_js.text)
         self.assertEqual(self.client.get("/viewer.js").status_code, 200)
         self.assertIn("geometry.index !== null", self.client.get("/viewer.js").text)
         self.assertEqual(self.client.get("/vendor/three/three.module.js").status_code, 200)

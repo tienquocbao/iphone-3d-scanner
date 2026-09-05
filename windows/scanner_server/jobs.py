@@ -7,10 +7,19 @@ import multiprocessing as mp
 import os
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RECONSTRUCTION = ROOT / "reconstruction"
+
+
+@lru_cache(maxsize=1)
+def nksr_diagnostics() -> dict[str, object]:
+    sys.path.insert(0, str(RECONSTRUCTION))
+    from nksr_backend import probe_nksr_backend, public_nksr_capability
+
+    return public_nksr_capability(probe_nksr_backend())
 
 
 def device_diagnostics() -> dict[str, object]:
@@ -30,6 +39,7 @@ def device_diagnostics() -> dict[str, object]:
         result["open3d_cuda_available"] = bool(getattr(o3d, "core", None) and o3d.core.cuda.is_available())
     except (ImportError, AttributeError):
         pass
+    result["nksr"] = nksr_diagnostics()
     return result
 
 
@@ -107,6 +117,14 @@ def _worker(session_dir: str, artifact_dir: str, kind: str, device: str) -> None
                 Path(session_dir), Path(artifact_dir), progress=progress
             )
             _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":"cpu","metrics":metrics,"finished_at":time.time()})
+        elif kind == "object_nksr":
+            from nksr_backend import build_object_nksr
+
+            def progress(value, message, metrics=None):
+                _write(job_path, {"state":"running","kind":kind,"progress":value,"message":message,"device":device,"started_at":started, **({"metrics":metrics} if metrics else {})})
+
+            metrics = build_object_nksr(Path(session_dir), Path(artifact_dir), progress=progress)
+            _write(job_path, {"state":"done","kind":kind,"progress":100,"message":"DONE","device":metrics.get("device",device),"metrics":metrics,"finished_at":time.time()})
         elif kind == "mesh":
             from reconstruct_tsdf import main as tsdf_main
 
@@ -128,12 +146,12 @@ class JobManager:
         self.processes: dict[str, mp.Process] = {}
 
     def start(self, session_id: str, kind: str, device: str = "auto") -> dict[str, object]:
-        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud", "object_tsdf"}:
+        if kind not in {"pointcloud", "mesh", "object_pointcloud", "registered_object_pointcloud", "object_tsdf", "object_nksr"}:
             raise ValueError("unsupported job kind")
         session_dir = self.sessions_root / f"session_{session_id}"
         if not session_dir.is_dir():
             raise ValueError("verified session does not exist")
-        if kind in {"object_pointcloud", "registered_object_pointcloud", "object_tsdf"}:
+        if kind in {"object_pointcloud", "registered_object_pointcloud", "object_tsdf", "object_nksr"}:
             try:
                 metadata = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
@@ -142,6 +160,8 @@ class JobManager:
                 raise ValueError("Build Object Point Cloud requires an Object Scan session")
             if kind == "registered_object_pointcloud" and len(metadata.get("passes") or []) < 2:
                 raise ValueError("Registered Object Cloud requires at least two completed passes")
+            if kind == "object_nksr" and not nksr_diagnostics().get("available"):
+                raise ValueError(f"NKSR unavailable: {nksr_diagnostics().get('reason', 'capability probe failed')}")
         artifact_dir = self.artifacts_root / f"session_{session_id}"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         active = self.processes.get(session_id)

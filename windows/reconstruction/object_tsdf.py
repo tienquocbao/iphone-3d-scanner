@@ -82,7 +82,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _session_passes(metadata: dict[str, object], frame_count: int) -> list[dict[str, int]]:
+def object_session_passes(metadata: dict[str, object], frame_count: int) -> list[dict[str, int]]:
     if metadata.get("scan_mode") != "object":
         raise SessionValidationError("Build Object Mesh (TSDF) requires scan_mode=object")
     raw_passes = metadata.get("passes")
@@ -155,7 +155,7 @@ def load_object_from_pass_transforms(
     return transforms, _sha256(transform_path)
 
 
-def _object_bounds(artifact_dir: Path, pass_count: int, margin: float) -> tuple[np.ndarray, np.ndarray, str]:
+def object_bounds(artifact_dir: Path, pass_count: int, margin: float) -> tuple[np.ndarray, np.ndarray, str]:
     candidates = (
         [artifact_dir / "object" / "object_registered_clean.ply"]
         if pass_count > 1
@@ -231,10 +231,10 @@ def build_object_tsdf(
     except (OSError, json.JSONDecodeError) as exc:
         raise SessionValidationError(f"Cannot read session.json: {exc}") from exc
     frame_dirs = session_frame_dirs(session_dir)
-    passes = _session_passes(metadata, len(frame_dirs))
+    passes = object_session_passes(metadata, len(frame_dirs))
     transform_path = artifact_dir / "object" / "registration" / "pass_transforms.json"
     transforms, transform_sha256 = load_object_from_pass_transforms(passes, transform_path)
-    bounds_min, bounds_max, bounds_source = _object_bounds(
+    bounds_min, bounds_max, bounds_source = object_bounds(
         artifact_dir, len(passes), config.object_bounds_margin_m
     )
     policy = TSDFPolicy(

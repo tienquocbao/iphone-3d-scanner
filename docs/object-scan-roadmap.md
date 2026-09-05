@@ -33,7 +33,15 @@ bound. Raw and conservatively cleaned colored PLY meshes are retained, and the
 reconstruction records the SHA-256 of the Gate B transform artifact so stale
 meshes are visible after registration changes.
 
+## Gate C2 — optional NKSR surface reconstruction
+
+Gate C2 prepares aligned object-frame `xyz`, per-point sensor origins, and RGB
+from the same masked source observations. Joint voxel aggregation preserves
+sensor provenance. A separately configured NKSR Python subprocess reconstructs
+the mesh, so missing packages, CUDA failures, and timeouts cannot compromise
+FastAPI or TSDF. NKSR is optional and its consistency metrics are not
+ground-truth accuracy measurements. See [object-nksr.md](object-nksr.md).
+
 ## Later gates
 
-- Gate C2: NKSR neural surface reconstruction and comparison with Gate C1.
 - Gate D: hand robustness, mesh cleanup, texture, and production exports.

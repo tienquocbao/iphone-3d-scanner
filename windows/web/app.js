@@ -6,6 +6,7 @@ const diagnostics = document.querySelector('#diagnostics');
 const objectDiagnostics = document.querySelector('#object-diagnostics');
 
 token.value = localStorage.getItem('iphone3d-token') || '';
+let nksrCapability = null;
 
 class DashboardError extends Error {
   constructor(kind, message, status = null) {
@@ -82,7 +83,7 @@ async function loadSessions() {
         row.append(cell);
       }
       const actions = document.createElement('td');
-      for (const [label, action] of [
+      for (const [label, action, disabled = false, title = ''] of [
         ...(item.scan_mode === 'object' ? [
           ['Build Object Point Cloud', () => start(item.session_id, 'object_pointcloud')],
           ['View Object Cloud', () => view(item.session_id, true)],
@@ -90,6 +91,10 @@ async function loadSessions() {
           ...(item.pass_count >= 2 ? [['Build Registered Object Cloud', () => start(item.session_id, 'registered_object_pointcloud')], ['View Registered', () => view(item.session_id, 'registered')]] : []),
           ['Build Object Mesh (TSDF)', () => start(item.session_id, 'object_tsdf')],
           ...(item.object_tsdf_state !== 'missing' ? [['View TSDF Mesh', () => view(item.session_id, 'tsdf')], ['TSDF diagnostics', () => void showTSDFDiagnostics(item.session_id, item.object_tsdf_state)]] : []),
+          ...(nksrCapability?.available && item.object_reconstruction_ready
+            ? [['Build Object Mesh (NKSR)', () => start(item.session_id, 'object_nksr')]]
+            : [[nksrCapability?.available ? 'NKSR registration required' : nksrCapability ? 'NKSR unavailable' : 'NKSR capability checking…', () => {}, true, nksrCapability?.available ? 'Build the required object cloud/registration first' : nksrCapability?.reason || 'Checking optional backend']]),
+          ...(item.object_nksr_state !== 'missing' ? [['View NKSR Mesh', () => view(item.session_id, 'nksr')], ['NKSR diagnostics', () => void showNKSRDiagnostics(item.session_id, item.object_nksr_state)]] : []),
         ] : []),
         ['Build point cloud', () => start(item.session_id, 'pointcloud')],
         ['Build mesh', () => start(item.session_id, 'mesh')],
@@ -99,6 +104,8 @@ async function loadSessions() {
         button.type = 'button';
         button.textContent = label;
         button.onclick = action;
+        button.disabled = disabled;
+        button.title = title;
         actions.append(button);
       }
       row.append(actions);
@@ -114,7 +121,10 @@ async function loadSessions() {
 async function loadDiagnostics() {
   try {
     const value = await api('/api/v2/diagnostics');
-    diagnostics.textContent = value.torch_cuda_available ? `CUDA: ${value.nvidia_gpu}` : 'CPU processing';
+    nksrCapability = value.nksr;
+    const base = value.torch_cuda_available ? `CUDA: ${value.nvidia_gpu}` : 'CPU processing';
+    diagnostics.textContent = `${base} · NKSR: ${value.nksr.available ? `Available (${value.nksr.cuda_available ? 'CUDA' : 'CPU'})` : 'Unavailable'}`;
+    void loadSessions();
   } catch (error) {
     diagnostics.textContent = sessionErrorMessage(error);
   }
@@ -147,6 +157,7 @@ async function poll(id, kind) {
     else if (state.state === 'done') {
       if (kind === 'object_pointcloud') void showObjectDiagnostics(id);
       if (kind === 'object_tsdf') void showTSDFDiagnostics(id, 'current');
+      if (kind === 'object_nksr') void showNKSRDiagnostics(id, 'current');
       void loadSessions();
     }
   } catch (error) {
@@ -158,8 +169,10 @@ let viewerModule;
 async function view(id, objectCloud) {
   try {
     viewerModule ||= await import('./viewer.js?v=2');
-    const artifactNames = objectCloud === 'tsdf'
-      ? ['object/reconstruction/tsdf/object_tsdf_clean.ply']
+    const artifactNames = objectCloud === 'nksr'
+      ? ['object/reconstruction/nksr/object_nksr_clean.ply']
+      : objectCloud === 'tsdf'
+        ? ['object/reconstruction/tsdf/object_tsdf_clean.ply']
       : objectCloud === 'registered'
         ? ['object/object_registered_clean.ply']
         : objectCloud
@@ -223,6 +236,31 @@ async function showTSDFDiagnostics(id, state) {
       const warning = document.createElement('p');
       warning.textContent = `Warning: ${warningText}`;
       objectDiagnostics.append(warning);
+    }
+  } catch (error) {
+    objectDiagnostics.textContent = sessionErrorMessage(error);
+  }
+}
+
+async function showNKSRDiagnostics(id, state) {
+  clearObjectDiagnostics();
+  try {
+    const report = await api(`/api/v2/sessions/${id}/artifacts/object/reconstruction/nksr/reconstruction.json`);
+    const mesh = report.mesh;
+    const summary = document.createElement('p');
+    summary.textContent = `Object mesh — Backend: NKSR; Device: ${report.device}; Input points: ${report.input_points}; Vertices: ${mesh.clean_vertices}; Triangles: ${mesh.clean_triangles}; Processing: ${report.processing_seconds.toFixed(2)} s`;
+    objectDiagnostics.append(summary);
+    if (state === 'stale') {
+      const warning = document.createElement('p');
+      warning.textContent = 'STALE — object registration changed; rebuild the NKSR mesh.';
+      objectDiagnostics.append(warning);
+    }
+    const consistency = report.observed_point_consistency || {};
+    for (const [label, value] of [['NKSR', consistency.observed_to_nksr], ['TSDF', consistency.observed_to_tsdf]]) {
+      if (!value) continue;
+      const metric = document.createElement('p');
+      metric.textContent = `${label} observed-point distance — median: ${value.median_m.toFixed(4)} m; p95: ${value.p95_m.toFixed(4)} m`;
+      objectDiagnostics.append(metric);
     }
   } catch (error) {
     objectDiagnostics.textContent = sessionErrorMessage(error);
