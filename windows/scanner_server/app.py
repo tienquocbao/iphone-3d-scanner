@@ -142,6 +142,14 @@ def create_app(storage_root: Path, bearer_token: str = "") -> FastAPI:
         return device_diagnostics()
 
     web_root = Path(__file__).resolve().parents[1] / "web"
+
+    @app.middleware("http")
+    async def refresh_dashboard_assets(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path in {"/", "/app.js", "/viewer.js", "/styles.css"}:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     app.mount("/", StaticFiles(directory=web_root, html=True), name="web")
     return app
 

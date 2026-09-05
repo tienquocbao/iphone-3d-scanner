@@ -1,5 +1,13 @@
 # Phase 3 V2: local capture, batch upload, and web jobs
 
+## Dashboard delivery
+
+The receiver serves the dashboard and its Three.js dependencies locally. The
+session list and diagnostics initialize before the optional WebGL viewer is
+loaded, so a viewer/WebGL failure does not prevent verification or browsing of
+received sessions. Dashboard assets use `no-cache` during development; job
+artifacts retain their normal response caching behavior.
+
 The iPhone capture pipeline is local-first:
 
 ```text

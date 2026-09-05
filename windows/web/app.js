@@ -1,14 +1,155 @@
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js';
-import {OrbitControls} from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/controls/OrbitControls.js';
-import {PLYLoader} from 'https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/loaders/PLYLoader.js';
+const token = document.querySelector('#token');
+const rows = document.querySelector('#sessions');
+const job = document.querySelector('#job');
+const dashboardStatus = document.querySelector('#dashboard-status');
+const diagnostics = document.querySelector('#diagnostics');
 
-const token=document.querySelector('#token'), rows=document.querySelector('#sessions'), job=document.querySelector('#job'), viewer=document.querySelector('#viewer'); token.value=localStorage.getItem('iphone3d-token')||'';
-const headers=()=>({'Authorization':`Bearer ${token.value}`,'X-Protocol-Version':'2'});
-async function api(path,options={}){const response=await fetch(path,{...options,headers:{...headers(),...(options.headers||{})}});if(!response.ok)throw new Error(await response.text());return response.json()}
-function bytes(value){return new Intl.NumberFormat(undefined,{style:'unit',unit:'megabyte',unitDisplay:'short',maximumFractionDigits:1}).format(value/1048576)}
-async function load(){localStorage.setItem('iphone3d-token',token.value);const [data,diag]=await Promise.all([api('/api/v2/sessions'),api('/api/v2/diagnostics')]);document.querySelector('#diagnostics').textContent=diag.torch_cuda_available?`CUDA: ${diag.nvidia_gpu}`:'CPU processing';rows.textContent='';for(const item of data.sessions){const tr=document.createElement('tr');tr.innerHTML=`<td>${item.session_id}</td><td>${item.frame_count}</td><td>${bytes(item.total_bytes)}</td><td>${item.created_at||'-'}</td><td><button data-point>Build point cloud</button><button data-mesh>Build mesh</button><button data-view>View</button></td>`;tr.querySelector('[data-point]').onclick=()=>start(item.session_id,'pointcloud');tr.querySelector('[data-mesh]').onclick=()=>start(item.session_id,'mesh');tr.querySelector('[data-view]').onclick=()=>view(item.session_id);rows.append(tr)}}
-async function start(id,kind){await api(`/api/v2/sessions/${id}/jobs`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,device:'auto'})});poll(id)}
-async function poll(id){const state=await api(`/api/v2/sessions/${id}/job`);job.textContent=`${state.state.toUpperCase()} ${state.progress||0}% — ${state.message||''}`;if(!['done','failed'].includes(state.state))setTimeout(()=>poll(id),1000);else if(state.state==='done')load()}
-let scene,camera,renderer,controls;function setup(){if(renderer)return;scene=new THREE.Scene();scene.background=new THREE.Color(0x090d13);camera=new THREE.PerspectiveCamera(55,viewer.clientWidth/viewer.clientHeight,.01,1000);camera.position.set(1,1,1);renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(viewer.clientWidth,viewer.clientHeight);viewer.append(renderer.domElement);controls=new OrbitControls(camera,renderer.domElement);scene.add(new THREE.HemisphereLight(0xffffff,0x223344,2));(function render(){requestAnimationFrame(render);controls.update();renderer.render(scene,camera)})()}
-async function view(id){setup();while(scene.children.length>1)scene.remove(scene.children.at(-1));const loader=new PLYLoader();let response=await fetch(`/api/v2/sessions/${id}/artifacts/pointcloud.ply`,{headers:headers()});let mesh=false;if(!response.ok){response=await fetch(`/api/v2/sessions/${id}/artifacts/mesh_mesh_clean.ply`,{headers:headers()});mesh=true}if(!response.ok){job.textContent='No point cloud or mesh artifact is available yet';return}const geometry=loader.parse(await response.arrayBuffer());geometry.computeBoundingSphere();const material=mesh?new THREE.MeshStandardMaterial({vertexColors:geometry.hasAttribute('color'),color:0x78aaff,side:THREE.DoubleSide}):(geometry.hasAttribute('color')?new THREE.PointsMaterial({size:.004,vertexColors:true}):new THREE.PointsMaterial({size:.004,color:0x66ccff}));scene.add(mesh?new THREE.Mesh(geometry,material):new THREE.Points(geometry,material));controls.target.copy(geometry.boundingSphere.center);camera.position.copy(geometry.boundingSphere.center).addScalar(Math.max(geometry.boundingSphere.radius*2,.5));job.textContent=`Viewing ${id}`}
-document.querySelector('#connect').onclick=()=>load().catch(error=>job.textContent=error.message);load().catch(()=>job.textContent='Enter the receiver bearer token and connect.');
+token.value = localStorage.getItem('iphone3d-token') || '';
+
+class DashboardError extends Error {
+  constructor(kind, message, status = null) {
+    super(message);
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+function headers() {
+  const value = token.value.trim();
+  return {
+    ...(value ? { Authorization: `Bearer ${value}` } : {}),
+    'X-Protocol-Version': '2',
+  };
+}
+
+async function api(path, options = {}) {
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers: { ...headers(), ...(options.headers || {}) },
+    });
+  } catch {
+    throw new DashboardError('network', 'Cannot reach receiver');
+  }
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 512);
+    if (response.status === 401) throw new DashboardError('auth', 'Authentication required', 401);
+    if (response.status >= 500) throw new DashboardError('server', 'Server error', response.status);
+    throw new DashboardError('request', detail || `Request failed (HTTP ${response.status})`, response.status);
+  }
+  return response.json();
+}
+
+function bytes(value) {
+  return new Intl.NumberFormat(undefined, {
+    style: 'unit', unit: 'megabyte', unitDisplay: 'short', maximumFractionDigits: 1,
+  }).format(value / 1048576);
+}
+
+function showSessionMessage(message) {
+  rows.replaceChildren();
+  const row = document.createElement('tr');
+  const cell = document.createElement('td');
+  cell.colSpan = 5;
+  cell.textContent = message;
+  row.append(cell);
+  rows.append(row);
+}
+
+function sessionErrorMessage(error) {
+  if (error instanceof DashboardError) return error.message;
+  return 'Unable to load verified sessions';
+}
+
+async function loadSessions() {
+  dashboardStatus.textContent = 'Loading sessions…';
+  try {
+    const data = await api('/api/v2/sessions');
+    rows.replaceChildren();
+    if (!data.sessions.length) {
+      dashboardStatus.textContent = 'No verified sessions';
+      showSessionMessage('No verified sessions');
+      return;
+    }
+    dashboardStatus.textContent = `${data.sessions.length} verified session${data.sessions.length === 1 ? '' : 's'}`;
+    for (const item of data.sessions) {
+      const row = document.createElement('tr');
+      for (const value of [item.session_id, item.frame_count, bytes(item.total_bytes), item.created_at || '-']) {
+        const cell = document.createElement('td');
+        cell.textContent = value;
+        row.append(cell);
+      }
+      const actions = document.createElement('td');
+      for (const [label, action] of [
+        ['Build point cloud', () => start(item.session_id, 'pointcloud')],
+        ['Build mesh', () => start(item.session_id, 'mesh')],
+        ['View', () => view(item.session_id)],
+      ]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.onclick = action;
+        actions.append(button);
+      }
+      row.append(actions);
+      rows.append(row);
+    }
+  } catch (error) {
+    const message = sessionErrorMessage(error);
+    dashboardStatus.textContent = message;
+    showSessionMessage(message);
+  }
+}
+
+async function loadDiagnostics() {
+  try {
+    const value = await api('/api/v2/diagnostics');
+    diagnostics.textContent = value.torch_cuda_available ? `CUDA: ${value.nvidia_gpu}` : 'CPU processing';
+  } catch (error) {
+    diagnostics.textContent = sessionErrorMessage(error);
+  }
+}
+
+async function loadDashboard() {
+  localStorage.setItem('iphone3d-token', token.value.trim());
+  await loadSessions();
+  void loadDiagnostics();
+}
+
+async function start(id, kind) {
+  try {
+    await api(`/api/v2/sessions/${id}/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, device: 'auto' }),
+    });
+    void poll(id);
+  } catch (error) {
+    job.textContent = sessionErrorMessage(error);
+  }
+}
+
+async function poll(id) {
+  try {
+    const state = await api(`/api/v2/sessions/${id}/job`);
+    job.textContent = `${state.state.toUpperCase()} ${state.progress || 0}% — ${state.message || ''}`;
+    if (!['done', 'failed'].includes(state.state)) setTimeout(() => void poll(id), 1000);
+    else if (state.state === 'done') void loadSessions();
+  } catch (error) {
+    job.textContent = sessionErrorMessage(error);
+  }
+}
+
+let viewerModule;
+async function view(id) {
+  try {
+    viewerModule ||= await import('./viewer.js?v=2');
+    await viewerModule.viewSession(id, { headers, job });
+  } catch {
+    job.textContent = '3D viewer unavailable';
+  }
+}
+
+document.querySelector('#connect').onclick = () => void loadDashboard();
+void loadDashboard();
